@@ -23,16 +23,15 @@ COPY --from=build --chown=65532:65532 /config /config
 # Everything magpie and the sign-ins it manages write goes into the volume:
 # its own files (/config/magpie), sign-ins kept where an agent keeps them
 # (~/.codex, ~/.claude…, under HOME), and the cache holding Bun and the
-# model catalog. magpie makes the folders a volume from an older image
-# lacks.
+# model catalog. For Railway deployment, use a Railway Volume mounted at
+# /config instead of this VOLUME instruction (Railway does not support
+# VOLUME in Dockerfiles). For local Docker, use: docker run -v magpie:/config
 ENV HOME=/config/home \
     XDG_CONFIG_HOME=/config \
     XDG_CACHE_HOME=/config/cache \
     XDG_DATA_HOME=/config/data \
     XDG_STATE_HOME=/config/state \
     MAGPIE_ADDR=0.0.0.0:3425
-
-VOLUME /config
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/magpie", "healthcheck"]
@@ -41,3 +40,4 @@ EXPOSE 3425 3430
 
 ENTRYPOINT ["/magpie"]
 CMD ["serve"]
+
