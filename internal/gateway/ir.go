@@ -125,6 +125,9 @@ type Request struct {
 	// Anthropic upstream: a relay that serves only Claude Code turns a
 	// request without it away (#359).
 	Metadata json.RawMessage
+	// Schema is the JSON schema an Anthropic client asked the answer to fit
+	// (output_config.format, of type json_schema).
+	Schema json.RawMessage
 	// GeminiCompat is the upstream being Gemini's OpenAI-compatible API
 	// (AI Studio's, or a proxy in front of it on this machine or the LAN),
 	// which gives the model's thoughts only when asked in thinking_config.
@@ -159,6 +162,7 @@ const (
 	KUsage                      // Usage
 	KError                      // Text
 	KSearch                     // Text (the query), Hits: a web search run for the model
+	KImage                      // Name (media type), Text (base64): an image the model made
 )
 
 // Event is one thing a streaming reply said.
@@ -308,6 +312,9 @@ func (c *collector) add(ev Event) {
 	case KSearch:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Search, Text: ev.Text, Hits: ev.Hits})
+	case KImage:
+		c.closeTool()
+		c.res.Parts = append(c.res.Parts, Part{Kind: Image, MediaType: ev.Name, Data: ev.Text})
 	}
 }
 
@@ -473,12 +480,13 @@ var effortRank = []string{"none", "minimal", "low", "medium", "high", "xhigh", "
 // setting can outlive the model it was picked for; GLM-5.3 takes low, high
 // and max only.
 //
-// Codex's ultra is max to a model without an ultra of its own (a routing
-// group offers it when a ChatGPT model in it does): sent as max, or the
-// nearest the model has below it.
+// Codex's ultra is no API's level, whatever a list says (ChatGPT's lists
+// it for Codex's picker; magpie offers it on Copilot's gpt-6.1-sol, #656):
+// it is sent as max, or the nearest the model has below it.
 func fitEffort(want string, levels []string) string {
-	if want == "ultra" && !slices.Contains(levels, want) {
+	if want == "ultra" {
 		want = "max"
+		levels = slices.DeleteFunc(slices.Clone(levels), func(l string) bool { return l == "ultra" })
 	}
 	if len(levels) == 0 || slices.Contains(levels, want) {
 		return want

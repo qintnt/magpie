@@ -31,7 +31,7 @@ const (
 	Chat      Protocol = "chat"      // OpenAI Chat Completions
 	Responses Protocol = "responses" // OpenAI Responses
 	Anthropic Protocol = "anthropic" // Anthropic Messages
-	Gemini    Protocol = "gemini"    // Google Gemini; only served to clients, never spoken upstream
+	Gemini    Protocol = "gemini"    // Google Gemini. Served to clients; spoken upstream only for Factory's generate route
 )
 
 // Protocols in the order magpie prefers them when it has to translate.
@@ -64,8 +64,8 @@ type Provider struct {
 	Responses string `json:"responses,omitempty"`
 	Anthropic string `json:"anthropic,omitempty"`
 	// Decide is the base of a decision API (TypeSafe's System One, which
-	// Jev answers): a provider with it serves no conversation, only the
-	// routing groups' choices of model and effort (see decide.go).
+	// Jev answers), for routing groups' choices of model and effort. The
+	// provider may also serve conversations on the other endpoints.
 	Decide string `json:"decide,omitempty"`
 
 	// Fallback is where a request goes when this provider can't take it —
@@ -351,8 +351,11 @@ func find(ps []Provider, id string) (Provider, bool) {
 
 // Find looks a provider up by id (or name, case-insensitively).
 func Find(id string) (*Provider, error) {
+	return findIn(All(), id)
+}
+
+func findIn(all []Provider, id string) (*Provider, error) {
 	q := strings.ToLower(strings.TrimSpace(id))
-	all := All()
 	// an id before a name: a provider of the user's called WorkBuddy isn't
 	// the workbuddy subscription
 	if i := slices.IndexFunc(all, func(p Provider) bool { return p.ID == q }); i >= 0 {
@@ -425,6 +428,9 @@ func Save(p Provider) error {
 				return errors.New("Azure OpenAI needs your resource's endpoint, e.g. https://<resource>.openai.azure.com")
 			}
 			return errors.New("a provider needs a base URL")
+		}
+		if strings.Contains(p.Decide, WorkspaceID) {
+			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
 		}
 		if p.Key == "" && !keyOptional(p) {
 			return fmt.Errorf("%s needs an API key", p.Name)
@@ -705,6 +711,13 @@ func normalize(p Provider) Provider {
 	if p.Preset == "opencode-zen" && p.Key == "" {
 		p.Key = OpenCodeAnonymousKey
 	}
+	// a Zen provider saved before its preset had System One for Jev
+	// (01huadalang: its Jev was asked as a chat model, and failed)
+	if p.Preset == "opencode-zen" && p.Decide == "" && p.Chat != "" {
+		if pr := Preset(p.Preset); pr != nil {
+			p.Decide = pr.Decide
+		}
+	}
 	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace {
 		p.Routing = ""
 	}
@@ -806,6 +819,12 @@ func (p Provider) Base(proto Protocol) string {
 		if p.Account != nil {
 			return p.Account.codeAssist
 		}
+	case Gemini:
+		// Factory's Gemini models are generateContent at /api/llm/g, not
+		// Code Assist. No other provider speaks Gemini upstream.
+		if p.ID == "factory" && p.Account != nil {
+			return factoryAPI + "/api/llm/g/v1"
+		}
 	}
 	return ""
 }
@@ -825,6 +844,11 @@ func (p Provider) Speaks() []Protocol {
 	// a plugin's Gemini models, beside what else it serves
 	if p.IsPlugin() && p.Account.codeAssist != "" {
 		out = append(out, CodeAssist)
+	}
+	// Factory's Gemini models, on generateContent. A model droid didn't
+	// list stays on the other three (factoryAPIs); this is not one of them.
+	if p.ID == "factory" && p.Account != nil {
+		out = append(out, Gemini)
 	}
 	return out
 }

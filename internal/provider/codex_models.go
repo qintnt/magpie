@@ -371,15 +371,16 @@ func CodexNativeHidden() map[string]bool {
 }
 
 // CodexListTag names the list Codex is handed, for its ETag: magpie's models
-// and the account's own taken out of it, so either changing has Codex ask
-// for the list again.
+// and the account's own taken out of it, and whether its OpenAI models say
+// multi-agent V1 (settings.CodexAgentsV1), so any of them changing has
+// Codex ask for the list again.
 func CodexListTag() string {
 	ms := CodexListed()
 	off := slices.Sorted(maps.Keys(CodexNativeHidden()))
 	for _, slug := range off {
 		ms = append(ms, catalog.Model{ID: "-" + slug})
 	}
-	return codexcat.Tag(ms)
+	return codexcat.PolicyTag(codexcat.Tag(ms))
 }
 
 // CodexNativePicked is the set of the ChatGPT account's own model slugs the
@@ -411,11 +412,12 @@ func codexListed(shown []Entry, members func(id string) []Member) []catalog.Mode
 	// named among all shown: the account's own, which the backend lists,
 	// are in Codex's picker beside these
 	labels := Labels(shown)
+	seen := described()
 	for i, e := range shown {
 		if e.Group == "" && e.Provider.Account != nil && e.Provider.Account.Agent == "codex" {
 			continue
 		}
-		m := catalog.Model{ID: e.ID, Name: labels[i], Efforts: e.Efforts, Images: e.Images, Context: e.Context}
+		m := catalog.Model{ID: e.ID, Name: labels[i], Efforts: e.Efforts, Images: e.Images || seen, Context: e.Context, AgentsV2: e.AgentsV2}
 		if e.Group != "" {
 			for _, mb := range members(e.ID) {
 				if a := mb.Provider.Account; a != nil && a.Agent == "codex" && strings.HasPrefix(mb.Model, "gpt-") {

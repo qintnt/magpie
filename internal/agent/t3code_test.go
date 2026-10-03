@@ -46,8 +46,21 @@ type t3Envelope struct {
 		BinaryPath   string `json:"binaryPath"`
 		HomePath     string `json:"homePath"`
 		CustomModels []struct {
-			Slug string `json:"slug"`
-			Name string `json:"name"`
+			Slug         string `json:"slug"`
+			Name         string `json:"name"`
+			Capabilities *struct {
+				OptionDescriptors []struct {
+					ID           string `json:"id"`
+					Label        string `json:"label"`
+					Type         string `json:"type"`
+					CurrentValue *bool  `json:"currentValue"`
+					Options      []struct {
+						ID        string `json:"id"`
+						Label     string `json:"label"`
+						IsDefault *bool  `json:"isDefault"`
+					} `json:"options"`
+				} `json:"optionDescriptors"`
+			} `json:"capabilities"`
 		} `json:"customModels"`
 	} `json:"config"`
 }
@@ -77,6 +90,25 @@ func t3Format(t *testing.T, raw []byte) t3Envelope {
 	for _, m := range e.Config.CustomModels {
 		if m.Slug == "" || m.Name == "" {
 			t.Errorf("custom model: %s", raw)
+		}
+		if m.Capabilities == nil {
+			continue
+		}
+		for _, d := range m.Capabilities.OptionDescriptors {
+			defaults := 0
+			for _, o := range d.Options {
+				if o.ID == "" || o.Label == "" {
+					t.Errorf("option: %s", raw)
+				}
+				if o.IsDefault != nil && *o.IsDefault {
+					defaults++
+				}
+			}
+			select_ := d.Type == "select" && len(d.Options) > 0 && defaults == 1 && d.CurrentValue == nil
+			boolean := d.Type == "boolean" && len(d.Options) == 0 && d.CurrentValue != nil
+			if d.ID == "" || d.Label == "" || !select_ && !boolean {
+				t.Errorf("descriptor: %s", raw)
+			}
 		}
 	}
 	return e
@@ -228,5 +260,71 @@ func TestT3CodeHomeAndInstance(t *testing.T) {
 	}
 	if _, ok := file["providerInstances"]["claudeAgent"]; !ok {
 		t.Error("the user's Claude instance is gone")
+	}
+}
+
+// Each magpie model in T3 Code has a Reasoning pick of the levels it takes
+// that Claude Code can send, medium chosen first, else the lowest (KevinXC
+// on Discord: every model ran at medium with no way to change it), and a
+// model that thinks at some level a Thinking switch, on at first, as T3's
+// own Claude Haiku has; neither for a model with no such level.
+func TestT3CodeEfforts(t *testing.T) {
+	type opt struct {
+		id  string
+		def bool
+	}
+	pick := func(id string, efforts []string) ([]opt, bool) {
+		c := t3Capabilities(id, efforts)
+		if c == nil {
+			return nil, false
+		}
+		raw, _ := json.Marshal(c)
+		var caps struct {
+			OptionDescriptors []struct {
+				ID, Label, Type string
+				CurrentValue    *bool
+				Options         []struct {
+					ID, Label string
+					IsDefault bool
+				}
+			}
+		}
+		json.Unmarshal(raw, &caps)
+		var out []opt
+		thinking := false
+		for _, d := range caps.OptionDescriptors {
+			switch {
+			case d.ID == "effort" && d.Type == "select" && out == nil:
+				for _, o := range d.Options {
+					if o.Label == "" {
+						t.Errorf("%s: no label: %s", id, raw)
+					}
+					out = append(out, opt{o.ID, o.IsDefault})
+				}
+			case d.ID == "thinking" && d.Type == "boolean" && d.Label == "Thinking" && d.CurrentValue != nil && *d.CurrentValue && !thinking:
+				thinking = true
+			default:
+				t.Fatalf("%s: %s", id, raw)
+			}
+		}
+		return out, thinking
+	}
+	for _, c := range []struct {
+		id       string
+		efforts  []string
+		want     []opt
+		thinking bool
+	}{
+		{"codex/gpt-6", []string{"none", "minimal", "low", "medium", "high", "xhigh"}, []opt{{"low", false}, {"medium", true}, {"high", false}, {"xhigh", false}}, true},
+		{"ds/deepseek-v4", []string{"high", "max"}, []opt{{"high", true}, {"max", false}}, true},
+		{"claude/claude-opus-4-6", []string{"low", "medium", "high", "xhigh", "max"}, []opt{{"low", false}, {"medium", true}, {"high", false}, {"max", false}}, true},
+		{"claude/claude-haiku-4-5", []string{"low", "medium", "high"}, nil, true},
+		{"glm/glm-4.6", []string{"none", "minimal"}, nil, true},
+		{"glm/glm-4.6", []string{"none"}, nil, false},
+		{"glm/glm-4.6", nil, nil, false},
+	} {
+		if got, thinking := pick(c.id, c.efforts); !slices.Equal(got, c.want) || thinking != c.thinking {
+			t.Errorf("%s %v: %v thinking %v, want %v thinking %v", c.id, c.efforts, got, thinking, c.want, c.thinking)
+		}
 	}
 }

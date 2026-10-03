@@ -8,6 +8,7 @@
 package settings
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -18,11 +19,14 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/redact"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // Settings is what the user chose. "" and "system" both mean "follow the OS".
@@ -103,7 +107,8 @@ type Settings struct {
 	// CodexAutoReset are the ChatGPT accounts (lower-case) that spend one
 	// of their rate-limit resets by themselves once their weekly window is
 	// used up and no other account can take the request: at most one a
-	// week each (see provider.AutoUseCodexReset).
+	// week each (see provider.AutoUseCodexReset); and one about to run out
+	// unused shortly before it does (provider.SpendExpiringCodexResets).
 	CodexAutoReset []string `json:"codexAutoReset,omitempty"`
 	// WorkBuddyCheckin presses WorkBuddy's daily check-in (签到) for each
 	// signed-in WorkBuddy (China) account once a Beijing day, claiming the
@@ -155,6 +160,11 @@ type Settings struct {
 	// is its windows stacked alone, a thin line between one card and the
 	// next.
 	TrayNoLogos bool `json:"trayNoLogos,omitempty"`
+	// Lightweight lets the webview of a window closed — the tray panel or
+	// the main window — go once it has stayed closed a while, and makes it
+	// again when it is opened (#580): less memory, a moment's wait. This
+	// computer's own (KeepOwn).
+	Lightweight bool `json:"lightweight,omitempty"`
 	// QuotaLeft shows a subscription's windows by how much of each is left,
 	// not used: the Usage page, the tray panel and the menu bar alike.
 	QuotaLeft bool `json:"quotaLeft,omitempty"`
@@ -177,6 +187,18 @@ type Settings struct {
 	// it (#92: "Opus 5.5", not "Opus 5.5 · Claude Code"), the vendor's names
 	// keeping their provider's after them (see provider.Labels).
 	PlainOwnNames bool `json:"plainOwnNames,omitempty"`
+	// CodexAgentsV1 has the OpenAI models magpie hands Codex — the ChatGPT
+	// account's own, their codex/ ids and the groups one is in — say
+	// multi_agent_version "v1" (#141): their subagents are then handed
+	// their tasks as text, which a magpie-served subagent can read, where
+	// V2's are sealed by OpenAI's server. Codex's features.multi_agent_v2
+	// still wins, and a thread keeps the version it started with.
+	CodexAgentsV1 bool `json:"codexAgentsV1,omitempty"`
+	// ChinaMirror is the Plugins page's 「国内镜像」 switch: the plugin list,
+	// npm (the plugins' packages and what npm says of them) and Bun's
+	// downloads are asked of mirrors in China first, and of their official
+	// addresses after (see source.China).
+	ChinaMirror bool `json:"chinaMirror,omitempty"`
 	// TextSize is how large the window's and the tray panel's pages are
 	// drawn, in percent (one of TextSizes): the webviews' own zoom, as a
 	// browser's, so the text and everything around it grow together.
@@ -189,6 +211,11 @@ type Settings struct {
 	AgentOrder   []string `json:"agentOrder,omitempty"`
 	AgentsHidden []string `json:"agentsHidden,omitempty"`
 	AgentsShown  []string `json:"agentsShown,omitempty"`
+	// UsageOrder is how the Usage page's cards are listed, by provider id,
+	// as they were dragged there; one it doesn't name follows in magpie's
+	// own order. Only the page's: the order providers are tried in is the
+	// Providers page's.
+	UsageOrder []string `json:"usageOrder,omitempty"`
 	// Visible narrows the models an agent is shown, by agent id: the
 	// families (the tag a provider or group is given), provider ids and
 	// group ids its lists hold. An agent it doesn't name is shown them all.
@@ -456,7 +483,7 @@ func CarryPerModel(in, cur *Settings) {
 // icon (yoooo on Discord: usage turned off on a Mac came back from a
 // Windows box that shows it).
 func (s *Settings) KeepOwn(cur Settings) {
-	s.Window, s.Proxy, s.Dock, s.DockWindow = cur.Window, cur.Proxy, cur.Dock, cur.DockWindow
+	s.Window, s.Proxy, s.Dock, s.DockWindow, s.Lightweight = cur.Window, cur.Proxy, cur.Dock, cur.DockWindow, cur.Lightweight
 	s.TrayUsages, s.TrayUsage, s.TrayUsageEvery, s.TrayNoLogos = cur.TrayUsages, cur.TrayUsage, cur.TrayUsageEvery, cur.TrayNoLogos
 }
 
@@ -508,11 +535,17 @@ func Dir() string { return appdir.Config() }
 // Portable is the data folder of a portable magpie, or "" when installed.
 func Portable() string { return appdir.Portable() }
 
+// Serialize reads with saves too: the editor preserves hard links by
+// writing them in place rather than replacing their inode.
+var fileMu sync.RWMutex
+
 // Load reads the settings; anything missing or unreadable is the default.
 func Load() Settings {
+	fileMu.RLock()
+	defer fileMu.RUnlock()
 	var s Settings
-	if b, err := os.ReadFile(Path()); err == nil {
-		_ = json.Unmarshal(b, &s)
+	if b, err := steady.ReadFile(Path()); err == nil {
+		_ = json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &s)
 	}
 	return s.normal()
 }
@@ -539,6 +572,8 @@ func CheckProxy(p string) error {
 
 // Save validates and writes the settings.
 func Save(s Settings) error {
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	s = s.normal()
 	if !slices.Contains(Themes, s.Theme) {
 		return fmt.Errorf("theme must be one of %v, not %q", Themes, s.Theme)
@@ -604,6 +639,7 @@ func Save(s Settings) error {
 	}
 	s.RedactRules = rules
 	s.AgentOrder, s.AgentsHidden, s.AgentsShown = ids(s.AgentOrder), ids(s.AgentsHidden), ids(s.AgentsShown)
+	s.UsageOrder = ids(s.UsageOrder)
 	s.TrayUsages = ids(s.TrayUsages)
 	for i, u := range s.CodexAutoReset {
 		s.CodexAutoReset[i] = strings.ToLower(u)
@@ -612,6 +648,19 @@ func Save(s Settings) error {
 	s.TrayUsage = ""
 	if len(s.TrayUsages) > 0 {
 		s.TrayUsage = s.TrayUsages[0]
+	}
+	// Load may have returned defaults or only part of an unreadable file.
+	// Do not replace it, including its permissions, with those values.
+	if b, err := steady.ReadFile(Path()); err == nil {
+		b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
+		if len(bytes.TrimSpace(b)) != 0 {
+			var stored Settings
+			if err := json.Unmarshal(b, &stored); err != nil {
+				return fmt.Errorf("could not read settings at %s; repair or move that file aside before saving: %w", Path(), err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("could not read settings at %s: %w", Path(), err)
 	}
 	if err := os.MkdirAll(Dir(), 0o755); err != nil {
 		return err
@@ -626,7 +675,16 @@ func Save(s Settings) error {
 			return err
 		}
 	}
-	return os.WriteFile(Path(), append(b, '\n'), 0o600)
+	// Open without truncating: read-only settings must still reject saves,
+	// and a new file must have the private mode WriteAtomic will preserve.
+	f, err := os.OpenFile(Path(), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return edit.WriteAtomic(Path(), append(b, '\n'))
 }
 
 func (s Settings) normal() Settings {

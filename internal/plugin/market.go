@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/source"
 )
 
 // The plugin market: the plugins magpie suggests, from the community
@@ -168,7 +169,9 @@ func Market(ctx context.Context) []Listing {
 	}
 	if src != "off" {
 		c, cancel := context.WithTimeout(ctx, 6*time.Second)
-		b, err := fetchJSON(c, src, 1<<20)
+		// the list names the packages installed: a copy of the very file
+		// may stand in for it (with 「国内镜像」), a proxy may not
+		b, err := fetchJSONFaithful(c, src, 1<<20)
 		cancel()
 		if err == nil {
 			if l, err := parseMarket(b); err == nil {
@@ -191,14 +194,30 @@ func Market(ctx context.Context) []Listing {
 	return l
 }
 
+// RefreshMarket has the next Market fetch the list again, as with the
+// 「国内镜像」 switch just turned on; the one held is kept till then.
+func RefreshMarket() {
+	marketMu.Lock()
+	marketAt = time.Time{}
+	marketMu.Unlock()
+}
+
 func fetchJSON(ctx context.Context, u string, limit int64) ([]byte, error) {
+	return fetchJSONFrom(ctx, u, limit, source.Do)
+}
+
+func fetchJSONFaithful(ctx context.Context, u string, limit int64) ([]byte, error) {
+	return fetchJSONFrom(ctx, u, limit, source.DoFaithful)
+}
+
+func fetchJSONFrom(ctx context.Context, u string, limit int64, do func(*http.Client, *http.Request) (*http.Response, error)) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "magpie")
 	req.Header.Set("Accept", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := do(http.DefaultClient, req)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +430,7 @@ func Search(ctx context.Context, q string) ([]Hit, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	v := url.Values{"text": {q + " opencode"}, "size": {"30"}}
-	b, err := fetchJSON(ctx, "https://registry.npmjs.org/-/v1/search?"+v.Encode(), 4<<20)
+	b, err := fetchJSON(ctx, npmRegistry+"/-/v1/search?"+v.Encode(), 4<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -474,7 +493,7 @@ func Readme(ctx context.Context, name string) (Page, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
-	b, err := fetchJSON(ctx, "https://registry.npmjs.org/"+npmPath(name), 32<<20)
+	b, err := fetchJSON(ctx, npmRegistry+"/"+npmPath(name), 32<<20)
 	if err != nil {
 		return Page{}, err
 	}

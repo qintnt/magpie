@@ -40,6 +40,7 @@ type modelJSON struct {
 	Rate     float64  `json:"rate,omitempty"`    // the credits a request costs the subscription, as a multiple
 	RateWas  float64  `json:"rateWas,omitempty"` // the rate before a discount running now
 	API      string   `json:"api,omitempty"`     // the one API the user said it is asked on
+	Auto     []string `json:"auto,omitempty"`    // the APIs its vendor's list says it is served on, what Auto asks it on
 	Same     string   `json:"same,omitempty"`    // the model the user said it is the same as, for the groups magpie finds (#583)
 	Merge    string   `json:"merge,omitempty"`   // what those groups merge it by when the user says nothing
 }
@@ -403,6 +404,11 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		}
 		if api, ok := p.ModelAPI(m.ID); ok {
 			j.API = string(api)
+		}
+		for _, a := range p.ListedAPIs(m.ID) {
+			if slices.Contains(provider.Protocols, a) {
+				j.Auto = append(j.Auto, string(a))
+			}
 		}
 		j.Same = sames[p.ID+"/"+m.ID]
 		j.Merge = provider.MergeName(m.ID)
@@ -993,6 +999,14 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				p = *saved
 			}
 			p = typed(p, in, req.Proxy)
+			if strings.TrimSpace(in.Decide) != "" {
+				// a decision API is asked its smallest question, at
+				// POST …/systemone (#647)
+				ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+				defer cancel()
+				writeJSON(rw, map[string]any{"results": []provider.Detection{p.DetectDecide(ctx, req.Model)}})
+				return
+			}
 			if len(req.DetectModels) > 0 {
 				// model by model, a few at a time (01huadalang: 应该能
 				// 看出来选择的模型支持情况)
@@ -1362,7 +1376,7 @@ func typed(p, in provider.Provider, proxy *string) provider.Provider {
 	for _, f := range []struct {
 		to *string
 		v  string
-	}{{&p.Chat, in.Chat}, {&p.Responses, in.Responses}, {&p.Anthropic, in.Anthropic}, {&p.ModelsURL, in.ModelsURL}} {
+	}{{&p.Chat, in.Chat}, {&p.Responses, in.Responses}, {&p.Anthropic, in.Anthropic}, {&p.Decide, in.Decide}, {&p.ModelsURL, in.ModelsURL}} {
 		if v := strings.TrimSpace(f.v); v != "" {
 			*f.to = v
 		}

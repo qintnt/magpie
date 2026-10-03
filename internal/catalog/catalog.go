@@ -51,6 +51,10 @@ type Model struct {
 	// Fast is set on a model Codex may ask for priority processing (its
 	// Fast mode): one a ChatGPT account serves.
 	Fast bool `json:",omitempty"`
+	// AgentsV2 is set on a model Codex is told multi-agent V2 for, so its
+	// Ultra hands work to Codex's agents: one offering Ultra that no
+	// ChatGPT account answers for (provider.Entry's).
+	AgentsV2 bool `json:",omitempty"`
 	// Draws is set on a vendor-listed model that makes images (gpt-image-1,
 	// a relay's flux): kept with the list for Settings → Images, never
 	// offered to agents as a model to talk to.
@@ -483,6 +487,12 @@ func ProviderName(id string) string {
 func Thinks(id string) bool {
 	load()
 	return thinks[bareID(id)]
+}
+
+// Knows reports whether models.dev lists a model of this id at all, under
+// any provider, as ContextOf and EffortsOf match it.
+func Knows(id string) bool {
+	return ContextOf(id) > 0 || len(EffortsOf(id)) > 0 || Thinks(id)
 }
 
 // SeesImages reports whether models.dev says a model of this id takes

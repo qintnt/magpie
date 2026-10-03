@@ -70,6 +70,17 @@ type Region struct {
 	// on another page than the preset's, is where its Get-a-key link goes.
 	Lists   bool   `json:"lists,omitempty"`
 	KeysURL string `json:"keysUrl,omitempty"`
+	// Decide is the region's decision API, for a preset that routes groups
+	Decide string `json:"decide,omitempty"`
+}
+
+// WorkspaceID stands in a decision API's address for the user's Bailian
+// workspace id (#647), which the editor and `workspace=` fill in.
+const WorkspaceID = "{WorkspaceId}"
+
+// bailianWorkspace is Bailian's System One root in a workspace of region.
+func bailianWorkspace(region string) string {
+	return "https://" + WorkspaceID + "." + region + ".maas.aliyuncs.com/compatible-mode/v1"
 }
 
 // presets are ordered as they appear in the picker.
@@ -248,6 +259,17 @@ var presets = []PresetDef{
 		Chat: "https://dashscope.aliyuncs.com/compatible-mode/v1", Anthropic: "https://dashscope.aliyuncs.com/apps/anthropic",
 		Note:    "DashScope · China",
 		Website: "https://bailian.console.aliyun.com", KeysURL: "https://bailian.console.aliyun.com/?tab=model#/api-key"},
+	// Alibaba Cloud Bailian's Token Plan (personal and team), a subscription
+	// on a key of its own (sk-sp-) that only its own host takes, serving
+	// chat completions and Anthropic messages. The models given are the
+	// plan's text models as its overview lists them, for when it gives no
+	// list.
+	{ID: "qwen-token-plan", Name: "Qwen Token Plan", Short: "Qwen Plan", Icon: "qwen-color", Kind: KindVendor,
+		Chat: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1", Anthropic: "https://token-plan.maas.qianwenaiapi.com/apps/anthropic",
+		Note:    "Bailian · subscription",
+		Website: "https://help.aliyun.com/zh/model-studio/token-plan-overview", KeysURL: "https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan/personal",
+		Models: []string{"auto", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
+			"deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2"}},
 	{ID: "mistral", Name: "Mistral", Icon: "mistral-color", Kind: KindVendor, Catalog: "mistral",
 		Chat:    "https://api.mistral.ai/v1",
 		Website: "https://console.mistral.ai", KeysURL: "https://console.mistral.ai/api-keys"},
@@ -315,6 +337,11 @@ var presets = []PresetDef{
 	{ID: "opencode-zen", Name: "OpenCode Zen", Icon: "opencode", Kind: KindRelay, Catalog: "opencode", NoKey: true,
 		KeyHint: "optional: free models need no key",
 		Chat:    "https://opencode.ai/zen/v1", Responses: "https://opencode.ai/zen/v1", Anthropic: "https://opencode.ai/zen",
+		// TypeSafe's Jev (jev-1.13, jev-1.13-free) is no chat model there:
+		// Zen serves it on System One at /zen/v1/systemone alone, as its
+		// docs' model table says (packages/web/src/content/docs/zen.mdx),
+		// so it routes groups like TypeSafe's own (#609's mixed provider)
+		Decide: "https://opencode.ai/zen/v1",
 		// its free models (-free) are served to OpenCode alone, which
 		// magpie asks them as (OpenCodeFree)
 		Website: "https://opencode.ai/docs/zen", KeysURL: "https://opencode.ai/auth"},
@@ -400,12 +427,29 @@ var presets = []PresetDef{
 		Decide:  "https://api.cloudflare.com/client/v4",
 		Note:    "routes groups · picks model and effort",
 		Website: "https://developers.cloudflare.com/ai/models/typesafe/jev/", KeysURL: "https://dash.cloudflare.com/profile/api-tokens"},
+	// Alibaba Cloud Bailian's decision model (#647), on Jev's System One
+	// API: at the host of the key's workspace (Beijing or Singapore), or
+	// the Token Plan's for its sk-sp- keys
+	{ID: "bailian-decision", Name: "Bailian Decision Model", Short: "Bailian Decision", Icon: "qwen-color", Kind: KindVendor,
+		Decide:      bailianWorkspace("cn-beijing"),
+		Note:        "routes groups · picks model and effort",
+		RegionLabel: "Plan", Regions: []Region{
+			{ID: "cn-beijing", Name: "Workspace · Beijing", Decide: bailianWorkspace("cn-beijing")},
+			{ID: "ap-southeast-1", Name: "Workspace · Singapore", Decide: bailianWorkspace("ap-southeast-1"),
+				KeysURL: "https://modelstudio.console.alibabacloud.com/?tab=playground#/api-key"},
+			{ID: "token-plan", Name: "Token Plan · Beijing", Decide: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+				KeysURL: "https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan/personal"},
+		},
+		Website: "https://help.aliyun.com/zh/model-studio/decision-model-preview", KeysURL: "https://bailian.console.aliyun.com/?tab=model#/api-key"},
 	{ID: "ollama", Name: "Ollama", Icon: "ollama", Kind: KindLocal, NoKey: true,
 		Chat: "http://localhost:11434/v1", Anthropic: "http://localhost:11434",
 		Note: "your local models", Website: "https://ollama.com"},
 	{ID: "lmstudio", Name: "LM Studio", Icon: "lmstudio", Kind: KindLocal, NoKey: true,
 		Chat: "http://localhost:1234/v1",
 		Note: "local server on :1234", Website: "https://lmstudio.ai"},
+	{ID: "omlx", Name: "oMLX", Icon: "omlx", Kind: KindLocal, NoKey: true,
+		Chat: "http://localhost:8000/v1", Responses: "http://localhost:8000/v1", Anthropic: "http://localhost:8000",
+		Note: "local server on :8000", Website: "https://omlx.ai"},
 }
 
 func bedrockChat(region string) string {

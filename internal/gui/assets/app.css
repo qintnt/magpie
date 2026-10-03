@@ -555,6 +555,20 @@ body.window .field.solo { grid-column: auto; }
 .credit-days .cd-day.unknown { background: none; outline: 1px dashed var(--line); outline-offset: -1px; }
 .credit-days .cd-day i { display: block; width: 100%; border-radius: 2px; background: var(--accent); }
 .credit-days .cd-note { margin-top: 4px; font-size: 10px; color: var(--faint); }
+/* what was left over time (#651): a line a window, an even burn dashed, now upright */
+.quota-curve { margin-top: 10px; }
+.quota-curve .qc-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; font-size: 10.5px; color: var(--muted); }
+.quota-curve .qc-range .opt { height: 20px; padding: 0 9px; font-size: 11px; }
+.quota-curve .qc-plot { display: block; width: 100%; height: 64px; margin-top: 6px; overflow: hidden; }
+.qc-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.qc-line { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.qc-even { stroke-width: 1; stroke-dasharray: 3 3; opacity: .55; vector-effect: non-scaling-stroke; }
+.qc-now { stroke: var(--faint); stroke-width: 1; stroke-dasharray: 1 2; vector-effect: non-scaling-stroke; }
+.quota-curve .qc-axis { display: flex; justify-content: space-between; margin-top: 3px; font-size: 10px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.quota-curve .qc-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; margin-top: 4px; font-size: 10.5px; color: var(--muted); }
+.qc-key { display: inline-flex; align-items: center; gap: 5px; }
+.qc-key i { width: 7px; height: 7px; border-radius: 50%; }
+.qc-key b { color: var(--fg-2); font-weight: 600; font-variant-numeric: tabular-nums; }
 .quota-resets { display: flex; align-items: center; gap: 8px; margin-top: 9px; font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .quota-resets .text { margin-left: auto; flex: none; font-size: 11px; padding: 2px 7px; }
 .subscription-card.several .quota-resets + .subscription-account { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
@@ -1146,6 +1160,10 @@ body.panel .profiles #save { height: 25px; } /* the field's: the line keeps its 
 .pq-rn { max-width: 44px; font-size: 9.5px; line-height: 1.2; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pq-rn2 { display: flex; flex-direction: column; align-items: center; }
 .pq-rn2 > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+/* the first window's current cycle, a thin line across the card (#651) */
+.pq-spark-box { grid-column: 1 / -1; display: block; height: 16px; }
+.pq-spark { display: block; width: 100%; height: 16px; overflow: hidden; }
+.pq-spark .qc-line { stroke-width: 1.2; }
 /* a Codex account's rate-limit resets, under a hairline across the card */
 .pq-resets { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 5px; padding-top: 7px; border-top: 1px solid var(--line-2); font-size: 11px; font-variant-numeric: tabular-nums; }
 .resets-words { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1562,6 +1580,8 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 /* a model's credit rate (0.5×): grey, a fact to pick by; a discount's price before it struck through */
 .badge.rate { background: var(--pill); color: var(--muted); letter-spacing: .02em; text-transform: none; font-variant-numeric: tabular-nums; display: inline-flex; gap: 3px; }
 .badge.rate s { font-weight: 500; opacity: .75; }
+/* the one API a model is asked on, picked by the user: the accent, as a choice made */
+.badge.mapi-tag { background: var(--accent-soft); color: var(--accent); letter-spacing: .02em; text-transform: none; }
 .mchip .badge { margin: 0 -3px 0 1px; padding: 0 4px; font-size: 9px; line-height: 14px; }
 .row.model .name .badge { margin-left: 6px; padding: 0 4px; font: 600 9px/14px var(--font); }
 .provider .pswitch { margin-left: 8px; }
@@ -1594,7 +1614,7 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .acc { display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 5px 8px 5px 11px; font-size: 12.5px; text-align: left; }
 .acc + .acc, .accts .signing { border-top: 1px solid var(--line-2); }
 .editor .accts .keep-login { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-height: 34px; padding: 6px 11px; font-size: 12px; border-top: 1px solid var(--line-2); }
-.editor .accts .keep-login select { max-width: 100%; font-size: 12px; }
+.editor .accts .keep-login .keep-as { max-width: 240px; }
 .acc .n { font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acc .plan { color: var(--muted); font-size: 11px; padding: 1px 6px; border-radius: 5px; background: var(--pill); white-space: nowrap; }
 .acc .grow { flex: 1; }
@@ -1664,9 +1684,10 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 #gatewayKeys .klf { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr); gap: 6px; }
 #gatewayKeys .klf-field { display: grid; gap: 3px; min-width: 0; }
 #gatewayKeys .klf-name { font-size: 11px; color: var(--muted); }
-#gatewayKeys .klf input, #gatewayKeys .klf select { width: 100%; min-width: 0; height: 28px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--fg); font: inherit; font-size: 12px; }
+#gatewayKeys .klf input { width: 100%; min-width: 0; height: 28px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--fg); font: inherit; font-size: 12px; }
 #gatewayKeys .klf-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-2); }
 #gatewayKeys .klf-err { color: var(--red); }
+#gatewayKeys .klf .klf-period { width: 100%; max-width: none; height: 28px; justify-content: space-between; color: var(--fg); }
 @media (max-width: 520px) { #gatewayKeys .klf { grid-template-columns: 1fr; } }
 /* the Settings row's picker: the key row's badge, always shown */
 .row.pref .proto.pick { flex: none; margin-left: auto; display: inline-flex; align-items: center; gap: 3px; height: 24px; padding: 0 6px 0 9px; font: inherit; font-size: 12px; color: var(--fg-2); border: 0; border-radius: 7px; background: var(--pill); white-space: nowrap; cursor: default; transition: background .12s, color .12s; }
@@ -1674,7 +1695,7 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .row.pref .proto.pick.open svg { transform: rotate(180deg); }
 .row.pref .proto.pick:hover, .row.pref .proto.pick.open { color: var(--fg); background: var(--pill-hover); }
 .row.pref .proto.pick.busy { opacity: .6; }
-.pop.proto-menu { width: 262px; max-height: none; padding: 4px; border: 1px solid var(--line); display: grid; gap: 1px; }
+.pop.proto-menu { width: 262px; max-height: min(360px, 70vh); overflow-y: auto; overscroll-behavior: contain; padding: 4px; border: 1px solid var(--line); display: grid; gap: 1px; }
 .proto-menu .pm-head { padding: 6px 8px 5px; font-size: 11px; color: var(--muted); }
 .proto-menu .pm-item { display: flex; align-items: flex-start; gap: 7px; width: 100%; padding: 6px 8px 7px; border: 0; border-radius: 7px; background: none; color: var(--fg); font: inherit; text-align: left; cursor: default; outline: none; }
 .proto-menu .pm-item:hover, .proto-menu .pm-item:focus { background: var(--pill); }
@@ -1769,12 +1790,6 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .move .dep-note .badge { flex: none; margin-top: 2px; }
 /* and in the add sheet, under the subscriptions */
 /* a deprecated subscription not signed in to: its plugin offered first */
-.signing.plugin-offer { flex-wrap: wrap; row-gap: 8px; }
-.signing.plugin-offer .mark.plug { background: none; color: var(--fg-2); }
-.signing.plugin-offer .pkg code { font: 11px/1.4 var(--mono, ui-monospace, monospace); color: var(--fg-2); }
-.signing.plugin-offer .offer-acts { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: -2px 0 0 27px; }
-.signing.plugin-offer .offer-acts .quiet { margin-right: auto; color: var(--muted); }
-.signing.plugin-offer .offer-acts .quiet:hover { color: var(--fg); }
 #fileError { margin: 0 0 10px; }
 #fileError .signing { border: 1px solid var(--line); border-radius: 10px; }
 #fileError .signing .mark { background: var(--red); }
@@ -2013,6 +2028,8 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .mchip.on { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 45%, transparent); font-weight: 500; }
 .mchip.on::before { content: "✓"; font-size: 10px; }
 .mchip.own.on::before { content: "＋"; }
+/* served with none picked: the vendor's list stands in for the picks */
+.mchip.auto { color: var(--accent); border-style: dashed; border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
 /* an image model in the editor: listed, not picked */
 .mchip.ro, .mchip.ro:hover { cursor: default; color: var(--muted); border-color: var(--line); }
 .mchip.ro:active { transform: none; }
@@ -2072,7 +2089,19 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .row.pref { min-height: 50px; padding: 8px 12px 8px 14px; gap: 14px; }
 .row.pref .who { flex: 1 1 auto; }
 .row.pref .sub { margin-top: 2px; }
-.session-terminal-select { flex: none; max-width: min(230px, 45%); min-width: 145px; height: 29px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--fg); font: inherit; font-size: 12px; }
+/* Keep export consent readable, and give collector URLs their own line. */
+#otelList .otel-section { padding: 10px 14px 6px; font-size: 11px; font-weight: 600; color: var(--muted); background: var(--pill); }
+#otelList .otel-section:not(:first-child) { border-top: 1px solid var(--line-2); }
+#otelList .row .sub { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
+#otelList .row { align-items: flex-start; padding-top: 12px; padding-bottom: 12px; }
+#otelList .otel-stacked { flex-wrap: wrap; gap: 8px; }
+#otelList .otel-stacked > .who { flex-basis: 100%; }
+#otelList .otel-stacked > .val { width: 100%; max-width: none; margin-left: 0; }
+#otelList input.words { width: 100%; }
+#otelList .otel-stacked .segs { margin-left: 0; max-width: 100%; flex-wrap: wrap; }
+#otelList .otel-env { padding: 12px 14px; border-top: 1px solid var(--line-2); font-size: 11.5px; color: var(--muted); }
+
+.session-terminal-select { max-width: min(230px, 45%); height: 29px; color: var(--fg); }
 .session-terminal-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .row.pref .segs { flex: none; margin-left: auto; }
 .proxy-segs { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 0; }
@@ -2371,8 +2400,16 @@ body.panel .modal { padding: 16px 12px; }
 .accts.sorting > [data-account-id] { animation: none; transition: transform .16s cubic-bezier(.22, 1, .36, 1); }
 .accts.sorting > .dragging { position: relative; z-index: 2; background: var(--card-2); box-shadow: 0 0 0 1px var(--line); cursor: grabbing; transition: none; will-change: transform; }
 .accts[aria-busy=true] > [data-account-id] { cursor: progress; }
+/* the Usage page's cards, dragged by their logos: a grip by the logo on hover */
+.subscription-head .us-handle { position: relative; width: 24px; height: 24px; margin: -4px -3px; }
+.subscription-head .us-handle::before { content: ""; position: absolute; left: -7px; top: 50%; width: 5px; height: 11px; margin-top: -5.5px; background: radial-gradient(circle, var(--muted) .9px, transparent 1.2px) 0 0 / 3.5px 3.75px; opacity: 0; transition: opacity .15s; }
+.subscription-card:is(:hover, .dragging) .us-handle::before, .us-handle:focus-visible::before { opacity: 1; }
+.subscription-usage.sorting { user-select: none; -webkit-user-select: none; }
+.subscription-usage.sorting > .subscription-card { transition: transform .22s cubic-bezier(.22, 1, .36, 1); }
+.subscription-usage.sorting .us-handle { cursor: grabbing; }
+.subscription-usage > .subscription-card.dragging { position: relative; z-index: 2; box-shadow: 0 8px 22px rgba(20, 22, 30, .14), 0 0 0 1px var(--line); transition: none; }
 @media (prefers-reduced-motion: reduce) {
-  .accts.sorting > [data-account-id], #agents.sorting > .row { transition: none; }
+  .accts.sorting > [data-account-id], #agents.sorting > .row, .subscription-usage.sorting > .subscription-card { transition: none; }
 }
 /* the show while the session files are indexed: the words on the left, a
    field of dots that light up as the files land on the right, a hairline

@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -72,7 +73,7 @@ func (g Group) Picked() string {
 }
 
 // routes are the members requests to the group may go to now: a manual
-// group's pick alone, else every one.
+// group's pick alone, else every one not switched off.
 func (g Group) routes() []string {
 	if g.Routing == Manual {
 		if p := g.Picked(); p != "" {
@@ -80,8 +81,11 @@ func (g Group) routes() []string {
 		}
 		return nil
 	}
-	return g.Members
+	return slices.DeleteFunc(slices.Clone(g.Members), g.IsOff)
 }
+
+// IsOff is whether the group's member id is switched off.
+func (g Group) IsOff(id string) bool { return slices.Contains(g.Off, id) }
 
 // Live is the group as the gateway routes it: a manual group's rules
 // wait (the member picked is all it sends to), though they are kept.
@@ -99,6 +103,10 @@ type Group struct {
 	Members  []string `json:"members"`            // "provider/model[:effort]" or "group/<id>", in order (see MemberEffort)
 	Routing  string   `json:"routing,omitempty"`  // as Provider.Routing, over all the members' keys and accounts; or Manual
 	Affinity string   `json:"affinity,omitempty"` // as Provider.Affinity
+	// Off are the members switched off: kept where they are in the
+	// order, with their rules, but sent nothing until switched on again,
+	// so trying a group without one doesn't mean taking it out.
+	Off []string `json:"off,omitempty"`
 	// Pick is the member a Manual group sends every request to, as the
 	// user picked it on the group's card; "" is its first. It is kept
 	// while the group routes otherwise, for when it is manual again.
@@ -497,7 +505,8 @@ func membersIn(entries []Entry, all []Group, g Group) []Member {
 // as the user named it, answering for its first member when an agent asks
 // what the model can do, and offering only the reasoning levels every
 // member has — but for those fixed at an effort of their own, which take
-// whatever the agent asks. With every member fixed, the group offers the
+// whatever the agent asks, and those whose levels nothing magpie reads
+// knows (levelsUnknown), which are sent it as asked. With every member fixed, the group offers the
 // levels they are fixed at, so that an agent still asks it to reason.
 // A group that names its own levels (Group.Levels) offers those, and so
 // does a group in it for its models.
@@ -516,20 +525,25 @@ func groupEntries(entries []Entry) []Entry {
 		var fixed []string // the efforts members are fixed at
 		levelled := false  // a member that follows the agent's effort was met
 		// Codex's ultra (max, with Codex handing parts of the task to agents
-		// of its own) is a level of ChatGPT's own models alone; a group with
-		// one of them in it, every member at max, offers it too, and the
+		// of its own) is a level of OpenAI's models that offer it (a ChatGPT
+		// account's, or one served elsewhere: OffersUltra); a group with one
+		// of them in it, every member at max, offers it too, and the
 		// gateway sends max to the members that have no ultra
 		ultra := false
+		chatgpt := false // a ChatGPT account answers for a member
 		for i, m := range ms {
+			chatgpt = chatgpt || m.Provider.Account != nil && m.Provider.Account.Agent == "codex"
 			if !slices.ContainsFunc(ms[:i], func(o Member) bool { return o.Provider.ID == m.Provider.ID }) {
 				e.Icons = append(e.Icons, m.Provider.Icon) // each provider once, "" for one without
 			}
 			var efforts []string
 			images, thinks, ctx, output := false, false, 0, 0
 			var imageInput *bool
+			unknown := false
 			for _, x := range entries {
 				if x.Provider.ID == m.Provider.ID && x.Model == m.Model {
 					efforts, images, thinks, ctx, output, imageInput = x.Efforts, x.Images, x.Reasoning, x.Context, x.Output, x.ImageInput
+					unknown = levelsUnknown(x)
 				}
 			}
 			e.Reasoning = e.Reasoning && thinks
@@ -554,6 +568,14 @@ func groupEntries(entries []Entry) []Entry {
 					fixed = append(fixed, m.Effort)
 				}
 				continue
+			} else if unknown {
+				// nothing magpie reads says which levels it takes, or that
+				// it takes none: the gateway sends it the effort asked as
+				// it is (fitEffort), so it doesn't take the others' away —
+				// a Token Plan's deepseek-v4-pro-202606 beside a TokenHub
+				// deepseek-v4-pro left the group none, and Pi only off
+				// (#597)
+				continue
 			}
 			ultra = ultra || slices.Contains(efforts, "ultra")
 			if !levelled {
@@ -572,6 +594,9 @@ func groupEntries(entries []Entry) []Entry {
 		if ultra && slices.Contains(e.Efforts, "max") && !slices.Contains(e.Efforts, "ultra") {
 			e.Efforts = append(e.Efforts, "ultra")
 		}
+		// V2 for Ultra only when no member is a ChatGPT account's: a lead
+		// it answers seals its subagents' tasks (#141)
+		e.AgentsV2 = !chatgpt && slices.Contains(e.Efforts, "ultra")
 		e.Reasoning = e.Reasoning || len(e.Efforts) > 0
 		if e.ImageInput != nil && !*e.ImageInput {
 			e.Images = false
@@ -584,6 +609,23 @@ func groupEntries(entries []Entry) []Entry {
 		out = append(out, e)
 	}
 	return out
+}
+
+// levelsUnknown reports whether nothing magpie reads says which reasoning
+// levels the model of x takes, or that it takes none: it has none in the
+// catalog, no account's list gives it, its vendor and its maker don't list
+// it, and models.dev lists no model of its id at all.
+func levelsUnknown(x Entry) bool {
+	if len(x.Efforts) > 0 || x.Provider.Account != nil && x.Provider.Account.models != nil {
+		return false
+	}
+	if _, ok := catalog.ListedBy(x.Provider.Catalogs(), x.Model); ok {
+		return false
+	}
+	if _, ok := catalog.ListedBy(makerCatalogs(), x.Model); ok {
+		return false
+	}
+	return !catalog.Knows(x.Model)
 }
 
 // SaveGroup adds or replaces a group of the user's. Changing one magpie
@@ -619,6 +661,16 @@ func SaveGroup(g Group) error {
 		g.Members[i] = cleanMember(entries, m)
 	}
 	g.Members = cleanList(g.Members)
+	var off []string
+	for _, m := range cleanList(g.Off) {
+		if m = cleanMember(entries, m); slices.Contains(g.Members, m) && !slices.Contains(off, m) {
+			off = append(off, m)
+		}
+	}
+	g.Off = off
+	if g.Routing != Manual && len(g.Off) == len(g.Members) {
+		return fmt.Errorf("every model in %s is switched off: switch one on, or it has nothing to send to", g.Name)
+	}
 	for i := range g.Rules {
 		g.Rules[i].Use = cleanMember(entries, strings.TrimSpace(g.Rules[i].Use))
 	}
@@ -895,6 +947,11 @@ func RenameGroup(from, to string) error {
 		}
 		if f.Groups[i].Pick == old {
 			f.Groups[i].Pick = now
+		}
+		for j, m := range f.Groups[i].Off {
+			if m == old {
+				f.Groups[i].Off[j] = now
+			}
 		}
 		if f.Groups[i].Classifier == old {
 			f.Groups[i].Classifier = now
