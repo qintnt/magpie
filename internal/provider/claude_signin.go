@@ -12,17 +12,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/claudecode"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/wslrun"
 )
 
 // claudeCLISignIn is a `claude auth login` magpie is running.
@@ -69,14 +74,84 @@ func claudeSignInEnv(env []string, dir string) []string {
 	return append(out, "CLAUDE_CONFIG_DIR="+dir)
 }
 
+// claudeCLI is the Claude Code a sign-in runs: this machine's, or, on
+// Windows without one, the one installed in a running WSL distro, which
+// signs in to the config directory magpie gives it all the same (wslrun).
+type claudeCLI struct {
+	path string
+	wsl  *wslrun.Tool
+}
+
+func findClaudeCLI() (claudeCLI, bool) {
+	if p := claudeExecutable(); p != "" {
+		return claudeCLI{path: p}, true
+	}
+	if t, ok := wslrun.Find("claude"); ok {
+		return claudeCLI{wsl: &t}, true
+	}
+	return claudeCLI{}, false
+}
+
+// ClaudeInWSL is the WSL distro the gateway runs Claude Code in, when there
+// is none on Windows itself and one was found there; "" otherwise. It never
+// waits on WSL: until a look has been made, one starts and "" comes back.
+func ClaudeInWSL() string {
+	if !wslrun.On || claudeExecutable() != "" {
+		return ""
+	}
+	if t, ok := wslrun.Known("claude"); ok {
+		return t.Distro
+	}
+	if lookingInWSL.CompareAndSwap(false, true) {
+		go func() {
+			defer lookingInWSL.Store(false)
+			wslrun.Find("claude")
+		}()
+	}
+	return ""
+}
+
+var lookingInWSL atomic.Bool
+
+func (c claudeCLI) command(ctx context.Context, args ...string) *exec.Cmd {
+	if c.wsl != nil {
+		return c.wsl.Command(ctx, args...)
+	}
+	return proc.CommandContext(ctx, c.path, args...)
+}
+
+func (c claudeCLI) probe(ctx context.Context, args ...string) *exec.Cmd {
+	if c.wsl != nil {
+		return c.wsl.Probe(ctx, args...)
+	}
+	return proc.ProbeContext(ctx, c.path, args...)
+}
+
+// env is env for a sign-in's Claude Code: for one in WSL, what of it goes
+// in, its config directory and browser told by their paths there.
+func (c claudeCLI) env(env []string) []string {
+	if c.wsl == nil {
+		return env
+	}
+	return c.wsl.Env(env, "CLAUDE_CONFIG_DIR/p", "BROWSER/p", openedURLEnv+"/p")
+}
+
+// proxied is env told the proxy choice names (netproxy.With), a SOCKS
+// one bridged: Claude Code is built with Bun, which takes only http:// and
+// https:// proxies (#2651). One in a WSL distro reaches the bridge only
+// when the distro shares Windows' loopback.
+func (c claudeCLI) proxied(choice string, env []string) ([]string, error) {
+	return netproxy.EnvForBunWith(choice, env, c.wsl == nil || c.wsl.Host == "")
+}
+
 // startClaudeSignIn runs `claude auth login` and gives the window the page
 // to open: the one Claude Code would have opened, which comes back to it on
 // this machine, or, when it opened none, the one it prints, whose page
 // shows a code to paste.
 func startClaudeSignIn(s *signInFlow) error {
-	path := claudeExecutable()
-	if path == "" {
-		return errors.New("install Claude Code first: magpie signs in to Claude through it")
+	cli, ok := findClaudeCLI()
+	if !ok {
+		return errors.New("install Claude Code first, the `claude` command line (the Claude desktop app is not it): magpie signs in to Claude through it; " + claudecode.InstallHint)
 	}
 	if err := os.MkdirAll(claudeDirsRoot(), 0o700); err != nil {
 		return err
@@ -92,9 +167,16 @@ func startClaudeSignIn(s *signInFlow) error {
 	opened := filepath.Join(dir, ".opened-url")
 	env := append(claudeSignInEnv(os.Environ(), dir), "BROWSER="+claudeURLOpener(), openedURLEnv+"="+opened)
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := proc.CommandContext(ctx, path, "auth", "login", "--claudeai")
+	cmd := cli.command(ctx, "auth", "login", "--claudeai")
 	cmd.Dir = dir
-	cmd.Env = netproxy.Env(env)
+	// through the proxy the account's requests will go through (#1663)
+	env, err = cli.proxied(s.proxy, env)
+	if err != nil {
+		cancel()
+		cleanup()
+		return err
+	}
+	cmd.Env = cli.env(env)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -120,7 +202,10 @@ func startClaudeSignIn(s *signInFlow) error {
 
 	printed := make(chan string, 1)
 	exited := make(chan string, 1)
+	var said lastSaid
+	claudeLogins.Add(1)
 	go func() {
+		defer claudeLogins.Done()
 		sc := bufio.NewScanner(out)
 		var tail []string
 		for sc.Scan() {
@@ -134,6 +219,7 @@ func startClaudeSignIn(s *signInFlow) error {
 			}
 			if line = strings.TrimSpace(strings.TrimPrefix(line, "Paste code here if prompted >")); line != "" {
 				tail = append(tail, line)
+				said.set(line)
 			}
 		}
 		err := cmd.Wait()
@@ -144,10 +230,10 @@ func startClaudeSignIn(s *signInFlow) error {
 			msg = tail[n-1]
 		}
 		if err == nil {
-			l, lerr := claudeSignedIn(path, dir)
+			l, lerr := claudeSignedIn(cli, dir, s.proxy)
 			if lerr == nil {
 				var using bool
-				if using, lerr = addLogin(l); lerr == nil {
+				if lerr = s.keep(func() (err error) { using, err = addLogin(l); return err }); lerr == nil {
 					cleanup()
 					s.finish(SignInState{State: "done", User: l.User, Plan: l.Plan, Using: using})
 					return
@@ -185,7 +271,7 @@ func startClaudeSignIn(s *signInFlow) error {
 		case <-grace:
 			if link == "" {
 				cancel()
-				return errors.New("claude auth login gave no link to open")
+				return claudeNoLink(cli, said.get())
 			}
 			s.mu.Lock()
 			s.st.URL, s.st.PasteCode = link, true
@@ -194,6 +280,38 @@ func startClaudeSignIn(s *signInFlow) error {
 		case <-tick.C:
 		}
 	}
+}
+
+// claudeLogins counts the runs of `claude auth login` still going on,
+// to the end of what each does after the CLI exits (the account added, its
+// folder removed). A sign-in that gave up has killed its run, but the run
+// may still be letting go; tests wait for it before the next one starts.
+var claudeLogins sync.WaitGroup
+
+// lastSaid is the last line a login command printed, which says why
+// there's no link.
+type lastSaid struct {
+	mu   sync.Mutex
+	line string
+}
+
+func (l *lastSaid) set(s string) { l.mu.Lock(); l.line = s; l.mu.Unlock() }
+
+func (l *lastSaid) get() string { l.mu.Lock(); defer l.mu.Unlock(); return l.line }
+
+// claudeNoLink is the error of a `claude auth login` that gave no link in
+// linkWait: what it last printed, or, when it printed nothing at all, the
+// program that was run, which may be a script that never starts Claude
+// Code (deluxe on Discord: a mise wrapper running itself), and how to see
+// what it does.
+func claudeNoLink(cli claudeCLI, last string) error {
+	if last != "" {
+		return errors.New("claude auth login gave no link to open: " + last)
+	}
+	if cli.path == "" {
+		return fmt.Errorf("claude auth login gave no link to open and printed nothing in %s", linkWait)
+	}
+	return fmt.Errorf("claude auth login gave no link to open: %s printed nothing in %s; run `%s auth login` in a terminal to see what it does", cli.path, linkWait, cli.path)
 }
 
 // claudeCallbackPort is the port a Claude sign-in page sends the browser
@@ -220,17 +338,21 @@ func isLoopback(host string) bool {
 
 // claudeSignedIn is the account `claude auth login` signed in to in config
 // directory dir, as magpie keeps it: the sign-in Claude Code kept, and who
-// it says that is.
-func claudeSignedIn(path, dir string) (savedLogin, error) {
+// it says that is, asked through the sign-in's proxy.
+func claudeSignedIn(cli claudeCLI, dir, proxy string) (savedLogin, error) {
 	c, ok := readClaudeDir(dir)
 	if !ok {
 		return savedLogin{}, errors.New("Claude Code signed in, but kept no sign-in magpie can read")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := proc.ProbeContext(ctx, path, "auth", "status", "--json")
+	cmd := cli.probe(ctx, "auth", "status", "--json")
 	cmd.Dir = dir
-	cmd.Env = claudeSignInEnv(os.Environ(), dir)
+	env, err := cli.proxied(proxy, claudeSignInEnv(os.Environ(), dir))
+	if err != nil {
+		return savedLogin{}, err
+	}
+	cmd.Env = cli.env(env)
 	b, _ := cmd.Output()
 	var status struct {
 		Email            string `json:"email"`

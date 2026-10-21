@@ -10,6 +10,7 @@
 package update
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,6 +26,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -125,15 +127,42 @@ func Newer(a, b string) bool {
 			return x.n[i] > y.n[i]
 		}
 	}
+	return comparePre(x.pre, y.pre) > 0
+}
+
+// comparePre orders two pre-releases the way semver does (§11): no
+// pre-release comes after any; otherwise identifier by identifier, numbers
+// as numbers ("beta.10" after "beta.9"), a number before a word, and a
+// shorter list before a longer one it starts.
+func comparePre(a, b string) int {
 	switch {
-	case x.pre == y.pre:
-		return false
-	case x.pre == "":
-		return true
-	case y.pre == "":
-		return false
+	case a == b:
+		return 0
+	case a == "":
+		return 1
+	case b == "":
+		return -1
 	}
-	return x.pre > y.pre
+	x, y := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(x) && i < len(y); i++ {
+		m, errM := strconv.ParseUint(x[i], 10, 64)
+		n, errN := strconv.ParseUint(y[i], 10, 64)
+		switch {
+		case errM == nil && errN == nil:
+			if m != n {
+				return cmp.Compare(m, n)
+			}
+		case errM == nil:
+			return -1
+		case errN == nil:
+			return 1
+		default:
+			if c := strings.Compare(x[i], y[i]); c != 0 {
+				return c
+			}
+		}
+	}
+	return cmp.Compare(len(x), len(y))
 }
 
 type semver struct {
@@ -143,6 +172,8 @@ type semver struct {
 
 func parse(v string) *semver {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	// build metadata ("+sha.5d0c1dc") plays no part in the order
+	v, _, _ = strings.Cut(v, "+")
 	v, pre, _ := strings.Cut(v, "-")
 	parts := strings.Split(v, ".")
 	if len(parts) != 3 {
@@ -318,12 +349,34 @@ func InstallAsAdmin(staged, bundle string) error {
 	return err
 }
 
-// Relaunch opens bundle again once this process (pid) has exited.
-func Relaunch(bundle string) error {
-	script := fmt.Sprintf(`while kill -0 %d 2>/dev/null; do sleep 0.2; done; open %q`, os.Getpid(), bundle)
+// Relaunch opens bundle again once this process (pid) has exited: with its
+// window when window is set, else only its menu bar icon (`tray`, as a
+// login launch), which a restart by itself uses while no window was up.
+func Relaunch(bundle string, window bool) error {
+	return runAfterExit(os.Getpid(), relaunchOpen(bundle, window))
+}
+
+// runAfterExit starts a shell that runs command once pid has exited. The
+// shell is in a session of its own: launchd ends the process group of a
+// job whose process exits, so one left in magpie's group was killed as
+// magpie quit and the new version never opened. That is the launch agent
+// of Open at login without AbandonProcessGroup (ee16c657), and, on macOS
+// 13 at least, the job LaunchServices runs an app in when it is opened from
+// the Dock or Finder, which magpie can't set that key on (#2362).
+func runAfterExit(pid int, command string) error {
+	script := fmt.Sprintf(`while kill -0 %d 2>/dev/null; do sleep 0.2; done; %s`, pid, command)
 	cmd := proc.Command("/bin/sh", "-c", script)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	detach(cmd)
 	return cmd.Start()
+}
+
+// relaunchOpen is the open command Relaunch runs for bundle.
+func relaunchOpen(bundle string, window bool) string {
+	if window {
+		return fmt.Sprintf("open %q", bundle)
+	}
+	return fmt.Sprintf("open %q --args tray", bundle)
 }
 
 // ReplaceBinary puts the release's build for this binary where the
@@ -376,8 +429,28 @@ func StageBinary(ctx context.Context, rel *Release) (string, error) {
 // InstallBinary swaps a staged binary in for exe, the running one, which
 // keeps going until it exits.
 func InstallBinary(staged, exe string) error {
+	_, err := InstallBinaryAside(staged, exe)
+	return err
+}
+
+// InstallBinaryAside is InstallBinary, saying where the running exe was
+// moved to on Windows ("" elsewhere), for RelaunchBinary to put it back
+// should the new version not start. A download this computer won't start
+// (Smart App Control, #894) isn't put in: a *BlockedError, and the
+// download removed.
+func InstallBinaryAside(staged, exe string) (string, error) {
 	var old string
 	if runtime.GOOS == "windows" {
+		// tried once per download: a restart clicked again after a failed
+		// one doesn't start it again, which would have an antivirus that
+		// checks a program as it starts hold it again for the move below
+		if !trialled.passed(staged) {
+			if err := canStart(staged); err != nil {
+				os.Remove(staged)
+				return "", &BlockedError{Err: err}
+			}
+			trialled.note(staged)
+		}
 		// A running .exe cannot be overwritten, but it can be moved aside.
 		// What the last update moved aside may still be running too (a
 		// `magpie serve` started before it), and can't be removed or
@@ -386,21 +459,36 @@ func InstallBinary(staged, exe string) error {
 		RemoveOld(exe)
 		var err error
 		if old, err = moveAside(exe); err != nil {
-			return err
+			return "", err
 		}
 	}
-	if err := os.Rename(staged, exe); err != nil {
+	if err := moveIn(staged, exe); err != nil {
+		if heldOpen(err) {
+			// the reason and what to do, shown as is in the version row
+			// and the Update pill's tooltip, without the paths
+			err = &saidError{fmt.Sprintf("couldn't put the new version in place of %s: another program still has the download open (often an antivirus checking it): let magpie through it and restart to update again, or download the new version and put it in place of this one", filepath.Base(exe)), err}
+		}
 		if old != "" {
-			if restoreErr := os.Rename(old, exe); restoreErr != nil {
-				return errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", filepath.Base(exe), old, restoreErr))
+			if restoreErr := moveIn(old, exe); restoreErr != nil {
+				return "", errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", filepath.Base(exe), old, restoreErr))
 			}
 		} else if !NeedsAdmin(err) { // kept for InstallBinaryAsAdmin
 			os.Remove(staged)
 		}
-		return err
+		return "", err
 	}
-	return nil
+	return old, nil
 }
+
+// saidError is err said in other words: what is shown, err what
+// errors.Is and errors.As find.
+type saidError struct {
+	said string
+	err  error
+}
+
+func (e *saidError) Error() string { return e.said }
+func (e *saidError) Unwrap() error { return e.err }
 
 // renameFile is os.Rename; tests make it fail.
 var renameFile = os.Rename
@@ -410,12 +498,97 @@ var renameFile = os.Rename
 // open, which Windows won't rename under, for a moment, and lets go.
 var asideWaits = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, 1500 * time.Millisecond}
 
+// heldFor is how long a file Windows says another program holds open is
+// waited for, past asideWaits, the last pause repeated: an antivirus that
+// checks a new program as it starts may hold a 50 MB download longer than
+// asideWaits' three seconds, and a restart that gave up then would fail
+// the same way on every click, each click's trial start having it checked
+// again (白菜 on Discord). The user clicked restart and sees "Restarting…"
+// meanwhile. A var for tests.
+var heldFor = 30 * time.Second
+
+// waitHeld is whether to try again after try i (from 0) failed with err,
+// begun at start, sleeping first when so: through asideWaits for any error
+// retry allows, then on while err is a file held open, up to heldFor.
+func waitHeld(i int, err error, start time.Time, retry bool) bool {
+	if !retry {
+		return false
+	}
+	if i < len(asideWaits) {
+		time.Sleep(asideWaits[i])
+		return true
+	}
+	if !heldOpen(err) || len(asideWaits) == 0 {
+		return false
+	}
+	pause := asideWaits[len(asideWaits)-1]
+	if time.Since(start)+pause > heldFor {
+		return false
+	}
+	time.Sleep(pause)
+	return true
+}
+
+// trialled is the download canStart last let through, by path, size and
+// time written, so a restart tried again on it doesn't start it again.
+var trialled trialNote
+
+type trialNote struct {
+	mu   sync.Mutex
+	path string
+	size int64
+	mod  time.Time
+}
+
+func (n *trialNote) passed(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.path == path && n.size == fi.Size() && n.mod.Equal(fi.ModTime())
+}
+
+func (n *trialNote) note(path string) {
+	fi, err := os.Stat(path)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if err != nil {
+		n.path = ""
+		return
+	}
+	n.path, n.size, n.mod = path, fi.Size(), fi.ModTime()
+}
+
 // Windows' errors for a file another program holds open without letting
 // it be renamed.
 const (
 	errSharingViolation syscall.Errno = 32
 	errLockViolation    syscall.Errno = 33
 )
+
+// moveIn moves from to exe, trying again for a few seconds while
+// something holds from open, as moveAside does for the running exe. On
+// Windows that is the download just after canStart's trial: an antivirus
+// that checks a program as its process starts can hold its file a moment
+// after the process has ended, and a move made at once failed the first
+// install of every update (#2272). Any other failure is returned at once.
+func moveIn(from, exe string) error {
+	start := time.Now()
+	for i := 0; ; i++ {
+		err := os.Rename(from, exe)
+		if err == nil || !waitHeld(i, err, start, heldOpen(err)) {
+			return err
+		}
+	}
+}
+
+// heldOpen is whether err is Windows refusing a file another program has
+// open.
+func heldOpen(err error) bool {
+	return errors.Is(err, errSharingViolation) || errors.Is(err, errLockViolation)
+}
 
 // moveAside moves the running exe out of the way of the new version, under
 // a name of its own, trying again for a few seconds while something has it
@@ -424,18 +597,18 @@ const (
 // so a failed installation can put the running exe back.
 func moveAside(exe string) (string, error) {
 	var err error
+	start := time.Now()
 	for i := 0; ; i++ {
 		old := oldName(exe)
 		if err = renameFile(exe, old); err == nil {
 			return old, nil
 		}
-		if errors.Is(err, fs.ErrNotExist) || i == len(asideWaits) {
-			break
-		}
 		if i == 0 {
 			os.Chmod(exe, 0o755) // a read-only exe: the attribute off
 		}
-		time.Sleep(asideWaits[i])
+		if !waitHeld(i, err, start, !errors.Is(err, fs.ErrNotExist)) {
+			break
+		}
 	}
 	why := err.Error()
 	var le *os.LinkError
@@ -444,7 +617,7 @@ func moveAside(exe string) (string, error) {
 	}
 	var hint string
 	switch {
-	case errors.Is(err, errSharingViolation), errors.Is(err, errLockViolation):
+	case heldOpen(err):
 		hint = "another program has it open (often an antivirus or OneDrive): let magpie through it and restart to update again, or download the new version and put it in place of this one"
 	case errors.Is(err, fs.ErrPermission):
 		hint = "Windows doesn't let magpie change files in " + filepath.Dir(exe) + " (an antivirus' folder protection, or the folder's permissions): let magpie through, or download the new version and put it in place of this one"
@@ -523,16 +696,18 @@ func InstallBinaryAsAdmin(staged, exe string) error {
 // RelaunchBinary starts exe again: with its window on view when window is
 // set (the window was open), else as the tray app alone, as autostart
 // starts it. The new process waits for this one to exit before it takes
-// the gateway's port; see AwaitPredecessor.
-func RelaunchBinary(exe string, window bool, view string) error {
-	cmd := proc.Command(exe, RelaunchArgs(window, view)...)
-	cmd.Env = append(os.Environ(), "MAGPIE_REPLACES="+strconv.Itoa(os.Getpid()))
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-	detach(cmd)
-	if err := cmd.Start(); err != nil {
-		return err
+// the gateway's port; see AwaitPredecessor. With old, where this one was
+// moved aside to (Windows), it waits for the new one to say it is up, and
+// when it can't start puts old back and says so (a *BlockedError): this
+// one then runs on rather than quitting.
+func RelaunchBinary(exe, old string, window bool, view string) error {
+	args := RelaunchArgs(window, view)
+	env := append(os.Environ(), "MAGPIE_REPLACES="+strconv.Itoa(os.Getpid()))
+	if old != "" {
+		return startChecked(exe, old, args, env)
 	}
-	return cmd.Process.Release()
+	_, _, err := launch(exe, args, env)
+	return err
 }
 
 // RelaunchArgs is what RelaunchBinary starts magpie with: `gui [view]` for
@@ -550,6 +725,7 @@ func RelaunchArgs(window bool, view string) []string {
 // AwaitPredecessor blocks, for a while at most, until the magpie that
 // relaunched this one has exited.
 func AwaitPredecessor() {
+	reportStarted() // first: the one that started this waits for it
 	pid, err := strconv.Atoi(os.Getenv("MAGPIE_REPLACES"))
 	os.Unsetenv("MAGPIE_REPLACES")
 	if err != nil || pid <= 0 {
@@ -591,16 +767,25 @@ func download(ctx context.Context, a Asset, path string) error {
 }
 
 func fetch(ctx context.Context, a Asset, path string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", a.URL, nil)
+	// through a mirror when one is given (mirror.go): the hash checked
+	// below is still the feed's
+	u := mirrored(mirrorOf(ctx), a.URL)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return err
 	}
 	res, err := source.Do(client, req)
 	if err != nil {
+		if u != a.URL {
+			return &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: err}
+		}
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
+		if u != a.URL {
+			return &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: fmt.Errorf("download %s through the mirror %s: %s", filepath.Base(path), strings.TrimSuffix(u, a.URL), res.Status)}
+		}
 		return fmt.Errorf("download %s: %s", filepath.Base(path), res.Status)
 	}
 	f, err := os.Create(path)
@@ -623,6 +808,12 @@ func fetch(ctx context.Context, a Asset, path string) error {
 	}
 	if err == nil && !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), a.SHA256) {
 		err = fmt.Errorf("%s does not match its checksum", filepath.Base(path))
+		if u != a.URL {
+			err = fmt.Errorf("%s from the mirror %s does not match its checksum from %s; not installed", filepath.Base(path), strings.TrimSuffix(u, a.URL), Site)
+		}
+	}
+	if err != nil && u != a.URL && !errors.As(err, new(*MirrorError)) {
+		err = &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: err}
 	}
 	if err != nil {
 		os.Remove(path)

@@ -1,8 +1,9 @@
 // Package imagemcp is `magpie mcp image`: a stdio MCP server an agent is
 // given, when it is picked for it in the Library, to make images with the
-// model the Settings' Image generation names, and videos with a Grok
-// subscription. It asks the gateway, which knows the providers, and saves
-// what comes back in the project.
+// model the Settings' Image generation names, and videos with the first
+// video model the gateway has (gateway.AutoVideomaker). It asks the
+// gateway, which knows the providers, and saves what comes back in the
+// project.
 package imagemcp
 
 import (
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Folder is where images go in the project when no path is given, and
@@ -64,8 +66,8 @@ var (
 
 var videoSchema = map[string]any{
 	"name": videoTool,
-	"description": "Generate a short video from a text prompt, optionally starting from an image to animate, with a Grok subscription signed in to Magpie " +
-		"(it has no other video model yet). It takes from ten seconds to a few minutes, then the video is saved as an mp4 file in the project (" + VideoFolder +
+	"description": "Generate a short video from a text prompt, optionally starting from an image to animate, with a video model set up in Magpie " +
+		"(a Grok subscription's Grok Imagine, Volcengine Ark Agent Plan's Seedance, another Magpie's, or a provider whose model list marks video models). It takes from ten seconds to a few minutes, then the video is saved as an mp4 file in the project (" + VideoFolder +
 		"/ unless path says where) and its path is returned; when it is not ready within about 20 seconds, the answer is an id to wait on with " + resultTool + " instead. Describe the subject, the motion and the camera: what moves, how, and what the shot is.",
 	"inputSchema": map[string]any{
 		"type": "object",
@@ -208,23 +210,42 @@ func stillGoing(j *job) string {
 // (Codex, Goose) are still given it, as a call's ceiling.
 func ToolTimeout() time.Duration { return videoWait + time.Minute }
 
+// callLongest is the most a call of this server to the gateway may take,
+// and how long a job left running is waited for once the agent has gone.
+// The gateway gives a vendor up to Settings' Image generation timeout to
+// draw (settings.ImageTimeoutMost minutes at the most), and may then fetch
+// what it drew for as long again (gateway.FetchImage): a call is cut only
+// past both. The gateway ends it at the user's own timeout; this server
+// may run where the settings aren't (an agent in WSL), so it never cuts a
+// drawing the setting allows (neighbads on X).
+func callLongest() time.Duration {
+	return max(ToolTimeout(), 2*settings.ImageTimeoutMost*time.Minute+time.Minute)
+}
+
 // Run serves MCP on stdin/stdout until stdin closes.
 func Run(args []string) error {
 	if len(args) > 0 && args[0] != "image" {
 		return fmt.Errorf("unknown MCP server %q (there is: image)", args[0])
 	}
+	if len(args) > 1 {
+		w, err := options(args[1:])
+		if err != nil {
+			return err
+		}
+		wsl = w
+	}
 	base := strings.TrimRight(os.Getenv("MAGPIE_GATEWAY"), "/")
 	if base == "" {
 		base = gateway.URL()
 	}
-	s := &server{gateway: base, client: &http.Client{Timeout: 6 * time.Minute}, enc: json.NewEncoder(os.Stdout), agent: gateway.DrawAgent, pending: map[string]chan rpc{}}
+	s := &server{gateway: base, client: &http.Client{Timeout: callLongest()}, enc: json.NewEncoder(os.Stdout), agent: gateway.DrawAgent, pending: map[string]chan rpc{}}
 	err := s.serve(os.Stdin)
 	// what is still being made is saved, though the agent has gone
 	done := make(chan struct{})
 	go func() { s.running.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(ToolTimeout()):
+	case <-time.After(callLongest()):
 	}
 	return err
 }
@@ -376,7 +397,10 @@ func (s *server) generate(raw json.RawMessage) (string, error) {
 	}
 	a.N = max(1, min(a.N, 4))
 	project := s.project()
-	req := map[string]any{"prompt": a.Prompt, "n": a.N}
+	// the images themselves, not URLs to fetch: the gateway fetches one a
+	// vendor keeps through the vendor's own proxy, the way it just reached
+	// it (#1576)
+	req := map[string]any{"prompt": a.Prompt, "n": a.N, "response_format": "b64_json"}
 	for k, v := range map[string]string{"size": a.Size, "quality": a.Quality, "background": a.Background} {
 		if v != "" {
 			req[k] = v
@@ -432,17 +456,22 @@ func (s *server) generate(raw json.RawMessage) (string, error) {
 	if len(out.Data) == 0 {
 		return "", errors.New("no image came back")
 	}
-	var saved, revised []string
+	// an image that was drawn, and paid for, is never dropped unsaid: one
+	// that can't be had is answered by where the vendor keeps it, beside
+	// those saved (#1576)
+	var saved, revised, lost []string
 	for i, d := range out.Data {
 		img, mt := []byte(nil), d.Mime
 		switch {
 		case d.B64 != "":
 			if img, err = base64.StdEncoding.DecodeString(d.B64); err != nil {
-				return "", fmt.Errorf("image %d: %w", i+1, err)
+				lost = append(lost, fmt.Sprintf("image %d came back broken: %v", i+1, err))
+				continue
 			}
 		case d.URL != "":
-			if img, mt, err = s.download(d.URL); err != nil {
-				return "", fmt.Errorf("image %d: %w", i+1, err)
+			if img, mt, err = gateway.FetchImage(context.Background(), gateway.PublicClient(), d.URL); err != nil {
+				lost = append(lost, fmt.Sprintf("image %d was drawn but couldn't be downloaded (%v); the vendor keeps it at %s for a while: download it from there", i+1, err, d.URL))
+				continue
 			}
 		default:
 			continue
@@ -467,10 +496,16 @@ func (s *server) generate(raw json.RawMessage) (string, error) {
 			revised = append(revised, d.Revised)
 		}
 	}
+	if len(saved) == 0 && len(lost) > 0 {
+		return "", errors.New(strings.Join(lost, "\n"))
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Generated with %s, saved to:\n", out.Model)
 	for _, p := range saved {
-		fmt.Fprintf(&b, "- %s\n", p)
+		fmt.Fprintf(&b, "- %s\n", shownPath(p))
+	}
+	for _, l := range lost {
+		fmt.Fprintf(&b, "Not saved: %s\n", l)
 	}
 	if len(revised) > 0 {
 		fmt.Fprintf(&b, "The model drew from this prompt: %s\n", revised[0])
@@ -483,12 +518,18 @@ func (s *server) generate(raw json.RawMessage) (string, error) {
 
 // project is the folder images are saved in: the client's first root when
 // it can say, else the folder the agent started magpie in. The home folder
-// or / isn't a project: ~/Pictures/Magpie is used then.
+// or / isn't a project: ~/Pictures/Magpie is used then (the distro's, for
+// an agent in WSL).
 func (s *server) project() string {
 	if dir := s.root(); dir != "" {
 		return dir
 	}
 	dir, _ := os.Getwd()
+	if wsl != nil && wsl.home != "" {
+		if d := wsl.shown(dir); d == "" || d == "/" || strings.TrimSuffix(d, "/") == strings.TrimSuffix(wsl.home, "/") {
+			return wsl.local(strings.TrimSuffix(wsl.home, "/") + "/Pictures/Magpie")
+		}
+	}
 	home, _ := os.UserHomeDir()
 	if dir == "" || dir == "/" || dir == home || filepath.Dir(dir) == dir {
 		return filepath.Join(home, "Pictures", "Magpie")
@@ -520,6 +561,9 @@ func (s *server) root() string {
 		json.Unmarshal(m.Result, &r)
 		for _, root := range r.Roots {
 			if u, err := url.Parse(root.URI); err == nil && u.Scheme == "file" && u.Path != "" {
+				if wsl != nil {
+					return wsl.local(u.Path)
+				}
 				return filePath(u)
 			}
 		}
@@ -555,6 +599,12 @@ func reference(project, ref string) (string, error) {
 	path := strings.TrimPrefix(ref, "file://")
 	if u, err := url.Parse(ref); err == nil && u.Scheme == "file" {
 		path = filePath(u)
+		if wsl != nil {
+			path = u.Path
+		}
+	}
+	if wsl != nil {
+		path = wsl.local(path)
 	}
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(project, path)
@@ -573,23 +623,6 @@ func reference(project, ref string) (string, error) {
 	return "data:" + mt + ";base64," + base64.StdEncoding.EncodeToString(b), nil
 }
 
-func (s *server) download(u string) ([]byte, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	r, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	res, err := s.client.Do(r)
-	if err != nil {
-		return nil, "", err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return nil, "", fmt.Errorf("%s: %s", u, res.Status)
-	}
-	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
-	mt, _, _ := mime.ParseMediaType(res.Header.Get("Content-Type"))
-	return b, mt, err
-}
-
 var unslug = regexp.MustCompile(`[^a-z0-9]+`)
 
 // target is where the i-th of n images goes: path as a file (numbered when
@@ -599,6 +632,9 @@ func target(project, path, prompt, ext string, i, n int) (string, error) {
 	dir, name := filepath.Join(project, folderFor(ext)), ""
 	if path != "" {
 		p := path
+		if wsl != nil {
+			p = wsl.local(p)
+		}
 		if strings.HasPrefix(p, "~/") {
 			home, _ := os.UserHomeDir()
 			p = filepath.Join(home, p[2:])
@@ -848,5 +884,5 @@ func (s *server) film(raw json.RawMessage) (string, error) {
 	if v.Seconds != "" {
 		length = v.Seconds + "-second "
 	}
-	return fmt.Sprintf("Generated a %svideo with %s, saved to:\n- %s\n", length, v.Model, path), nil
+	return fmt.Sprintf("Generated a %svideo with %s, saved to:\n- %s\n", length, v.Model, shownPath(path)), nil
 }

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 func histCard(user string, used5h float64, reset5h time.Time, usedWeek float64, resetWeek time.Time) SubscriptionQuota {
@@ -37,7 +39,7 @@ func lineOf(t *testing.T, hs []QuotaHistory, user, name string) []QuotaPoint {
 // before aren't kept; readings a minute apart within five are one point,
 // and a run of the same figure its first and last (#651).
 func TestQuotaHistoryRecords(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t0 := time.Date(2026, 10, 3, 8, 0, 0, 0, time.UTC)
 	r5, rw := t0.Add(3*time.Hour), t0.Add(4*24*time.Hour)
@@ -85,7 +87,7 @@ func TestQuotaHistoryRecords(t *testing.T) {
 // folded into the one before, a rolling window's reset moving with the
 // clock isn't one, and points older than 45 days go.
 func TestQuotaHistoryCycles(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t0 := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	week := t0.Add(7 * 24 * time.Hour)
@@ -121,11 +123,46 @@ func TestQuotaHistoryCycles(t *testing.T) {
 	}
 }
 
+// A refill can leave the deadline alone, advance it or bring it forward.
+// Preserve both readings even when they are too close for normal sampling.
+func TestQuotaHistoryUnscheduledResets(t *testing.T) {
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	reset := at.Add(7 * 24 * time.Hour)
+	a := QuotaPoint{At: at, Left: 20, ResetsAt: &reset}
+	for _, tc := range []struct {
+		name       string
+		gap, moved time.Duration
+		left       float64
+		want       bool
+	}{
+		{"refill with unchanged deadline", time.Minute, 0, 100, true},
+		{"refill with rounded deadline", 10 * time.Minute, time.Minute, 100, true},
+		{"manual restart", time.Minute, 24 * time.Hour, 100, true},
+		{"official earlier restart", time.Minute, -24 * time.Hour, 100, true},
+		{"ordinary reset", 7 * 24 * time.Hour, 7 * 24 * time.Hour, 100, true},
+		{"small correction", time.Minute, 0, 24, false},
+		{"deadline rounding", time.Minute, time.Minute, 20, false},
+		{"rolling recovery", time.Hour, time.Hour, 80, false},
+		{"fast rolling recovery", time.Minute, time.Minute, 80, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := reset.Add(tc.moved)
+			b := QuotaPoint{At: at.Add(tc.gap), Left: tc.left, ResetsAt: &r}
+			if got := newCycle(a, b); got != tc.want {
+				t.Fatalf("cycle break = %v, want %v", got, tc.want)
+			}
+			if tc.want && len(addPoint([]QuotaPoint{a}, b)) != 2 {
+				t.Fatal("reset folded into previous cycle")
+			}
+		})
+	}
+}
+
 // TestMergeQuotaHistory: another computer's points join this one's: the
 // union, sorted, two within half a minute of each other the newer one,
 // and merging the same again changes nothing.
 func TestMergeQuotaHistory(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t0 := time.Date(2026, 10, 3, 8, 0, 0, 0, time.UTC)
 	r := t0.Add(4 * time.Hour)

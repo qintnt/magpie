@@ -55,7 +55,7 @@ function server(lang, asked) {
 
 const L = {
   en: { installed: "Installed", signIn: "Sign in", other: "Sign in to Qoder CN", signedIn: "Signed in", tip: /Qoder CN is a subscription of its own; Qoder works without it/ },
-  zh: { installed: "已安装", signIn: "登录", other: "登录 Qoder CN", signedIn: "已登录", tip: /Qoder CN 是另一个独立的订阅，Qoder 不需要它也能用/ },
+  zh: { installed: "已安装", signIn: "登录", other: "登录 Qoder CN", signedIn: "已登录", tip: /Qoder CN 是独立订阅，Qoder 无需它也能使用/ },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -80,7 +80,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await view.locator(`.pm-card[data-pkg="${ZED}"] .pm-act`).innerText()).trim(), w.signIn);
 
         // Installed: the row names the other, quietly
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const qoder = view.locator(".pm-row").filter({ hasText: "Qoder CN" });
         await qoder.waitFor();
         const b = qoder.locator(".val button", { hasText: w.other });

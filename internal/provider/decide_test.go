@@ -61,8 +61,13 @@ func TestMixedDecisionProvider(t *testing.T) {
 	if _, ms, ok := FindGroup("group/auto-deepseek-v4-1-flash"); !ok || len(ms) != 2 || ms[0].Provider.ID != p.ID {
 		t.Fatalf("automatic group: %+v %v", ms, ok)
 	}
-	if err := SaveGroup(Group{Name: "Bad", Members: []string{"mixed/typesafe/jev"}}); err == nil {
+	// alone it is a group of decision models (decide_group.go); beside a
+	// model that holds conversations it is refused
+	if err := SaveGroup(Group{Name: "Bad", Members: []string{"mixed/deepseek-v4.1-flash", "mixed/typesafe/jev"}}); err == nil {
 		t.Fatal("Jev accepted as a conversation member")
+	}
+	if err := SaveGroup(Group{Name: "Judges", Members: []string{"mixed/typesafe/jev"}}); err != nil {
+		t.Fatalf("a group of decision models: %v", err)
 	}
 	if got, m, err := RouteDecider("mixed/typesafe/jev"); err != nil || got.ID != p.ID || m != "typesafe/jev" {
 		t.Fatalf("Jev route: %+v %s %v", got, m, err)
@@ -107,8 +112,8 @@ func TestMixedDecisionProvider(t *testing.T) {
 	}
 }
 
-// A decision provider (TypeSafe's Jev) is only ever a group's classifier:
-// its models aren't in the catalog nor a group's members, and a group's
+// A decision provider (TypeSafe's Jev) is a chat group's classifier, never
+// one of its models: its models aren't in the catalog, and a group's
 // effort is picked only by it.
 func TestDecider(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -158,8 +163,10 @@ func TestDecider(t *testing.T) {
 	if g, _, _ := FindGroup("group/g"); g.Effort != EffortAuto || g.Classifier != "typesafe/jev-latest" || !g.Ruled() {
 		t.Fatalf("saved %+v", g)
 	}
-	if err := SaveGroup(Group{Name: "H", Members: []string{"typesafe/jev-latest"}}); err == nil {
-		t.Error("Jev saved as a group's member")
+	// beside a model that holds conversations it is refused; a group of
+	// decision models alone is a decision group (decide_group_test.go)
+	if err := SaveGroup(Group{Name: "H", Members: []string{"a/m", "typesafe/jev-latest"}}); err == nil {
+		t.Error("Jev saved in a group beside a chat model")
 	}
 }
 
@@ -313,21 +320,21 @@ func TestFetchDecideOpenAIJevIDs(t *testing.T) {
 		t.Fatalf("test %+v", r)
 	}
 
-	names, err := listedDecide([]byte(`{"models":[{"name":"jev-latest"},{"name":"other-model"}],"data":[{"id":"gemini-3"}]}`))
+	names, err := listedDecide([]byte(`{"models":[{"name":"jev-latest"},{"name":"other-model"}],"data":[{"id":"gemini-3"}]}`), false)
 	if err != nil || len(names) != 2 || names[0].ID != "jev-latest" || names[1].ID != "other-model" {
 		t.Fatalf("names %+v %v", names, err)
 	}
-	byID, err := listedDecide([]byte(`{"models":[{"id":"jev-preview"},{"id":"gemini-3"}]}`))
+	byID, err := listedDecide([]byte(`{"models":[{"id":"jev-preview"},{"id":"gemini-3"}]}`), false)
 	if err != nil || len(byID) != 1 || byID[0].ID != "jev-preview" {
 		t.Fatalf("id %+v %v", byID, err)
 	}
-	if ms, err := listedDecide([]byte(`{"data":[{"id":"gemini-3.8-flash"}]}`)); err != nil || len(ms) != 0 {
+	if ms, err := listedDecide([]byte(`{"data":[{"id":"gemini-3.8-flash"}]}`), false); err != nil || len(ms) != 0 {
 		t.Fatalf("unrelated %+v %v", ms, err)
 	}
-	if _, err := listedDecide([]byte(`<html>`)); err == nil || err.Error() != "not a model list" {
+	if _, err := listedDecide([]byte(`<html>`), false); err == nil || err.Error() != "not a model list" {
 		t.Fatal(err)
 	}
-	if ms, err := listedDecide([]byte(`{"data":[{"id":"jevons"},{"id":"foo/jevx"}]}`)); err != nil || len(ms) != 0 {
+	if ms, err := listedDecide([]byte(`{"data":[{"id":"jevons"},{"id":"foo/jevx"}]}`), false); err != nil || len(ms) != 0 {
 		t.Fatalf("jevons %+v %v", ms, err)
 	}
 }
@@ -514,6 +521,11 @@ func TestAPIErrorShapes(t *testing.T) {
 	if got := APIError(nil, "400 Bad Request"); got != "400 Bad Request" {
 		t.Fatal(got)
 	}
+	// Command Code's refusal of a Go plan's key says where it works (#969)
+	goKey := `{"error":{"type":"forbidden","message":"Your Go plan doesn't include API access. Upgrade to Provider or higher at https://commandcode.ai/billing to use these endpoints."}}`
+	if got := APIError([]byte(goKey), "403 Forbidden"); got != "Your Go plan doesn't include API access. Upgrade to Provider or higher at https://commandcode.ai/billing to use these endpoints. — "+CommandCodeGoHint {
+		t.Fatal(got)
+	}
 }
 
 // A backend that only streams is tested with a streamed request: WorkBuddy
@@ -531,5 +543,53 @@ func TestTinyStreamsStreamOnly(t *testing.T) {
 			t.Errorf("%s: %s", proto, b)
 		}
 		p.Account = nil
+	}
+}
+
+// Workers AI's own decision models, Clef and Clef Flash, are offered
+// beside Jev, routed to by name, and each asked at its own run.
+func TestCloudflareClef(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	p, err := FromPreset("cloudflare-jev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Key, p.Decide = "k", "https://api.cloudflare.com/client/v4/accounts/acc7/ai/run"
+	var ids []string
+	for _, m := range p.Available() {
+		ids = append(ids, m.ID)
+	}
+	if strings.Join(ids, " ") != "typesafe/jev @cf/cloudflare/clef @cf/cloudflare/clef-flash" || p.Jev() != "typesafe/jev" {
+		t.Fatalf("offered %v, default %s", ids, p.Jev())
+	}
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"cloudflare-jev/@cf/cloudflare/clef-flash", "@cf/cloudflare/clef"} {
+		got, model, err := RouteDecider(name)
+		if err != nil || got.ID != "cloudflare-jev" || !strings.HasSuffix(name, model) {
+			t.Fatalf("%s: %s %s %v", name, got.ID, model, err)
+		}
+	}
+	if !IsDecider("cloudflare-jev/@cf/cloudflare/clef") {
+		t.Fatal("Clef is not a classifier")
+	}
+	for model, want := range map[string]string{
+		"typesafe/jev":              "https://api.cloudflare.com/client/v4/accounts/acc7/ai/run",
+		"@cf/cloudflare/clef":       "https://api.cloudflare.com/client/v4/accounts/acc7/ai/run/@cf/cloudflare/clef",
+		"@cf/cloudflare/clef-flash": "https://api.cloudflare.com/client/v4/accounts/acc7/ai/run/@cf/cloudflare/clef-flash",
+	} {
+		if u, err := p.DecideModelURL(context.Background(), model); err != nil || u != want {
+			t.Errorf("%s at %s %v", model, u, err)
+		}
+	}
+	// another System One provider's model named so is no Clef
+	o := Provider{ID: "o", Name: "O", Key: "k", Decide: "https://api.typesafe.ai/v1", Chat: "https://api.typesafe.ai/v1"}
+	if o.DecidesModel("@cf/cloudflare/clef") {
+		t.Fatal("a Clef id outside Workers AI decides")
 	}
 }

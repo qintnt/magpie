@@ -6,9 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -20,7 +23,7 @@ func zenServer(t *testing.T, reply string) (*Server, map[string][]map[string]any
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	for _, p := range []provider.Provider{
-		{ID: "zen", Name: "Zen", Key: "public", Chat: "https://opencode.ai/zen/v1", Models: []string{"mimo-v2.6-flash-free", "kimi-k2.6"}},
+		{ID: "zen", Name: "Zen", Key: "public", Chat: "https://opencode.ai/zen/v1", Models: []string{"mimo-v2.6-flash-free", "kimi-k2.6", "big-pickle", "nemo-zero"}},
 		{ID: "other", Name: "Other", Key: "k", Chat: "https://other.test/v1", Models: []string{"mimo-v2.6-flash-free"}},
 	} {
 		if err := provider.Save(p); err != nil {
@@ -206,6 +209,36 @@ func TestZenFreeOnlyFreeModels(t *testing.T) {
 	}
 }
 
+// Zen's free models whose ids don't end in -free are asked as OpenCode
+// asks too (361 on Discord: big-pickle answered 403 FreeTierError): one
+// known without the catalog, and one models.dev's opencode prices at
+// nothing; one it prices is not.
+func TestZenFreeZeroCostModels(t *testing.T) {
+	s, got := zenServer(t, chatSSE("hi", "", ""))
+	if err := os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalog.CachePath(), []byte(`{"opencode":{"models":{
+		"nemo-zero":{"id":"nemo-zero","cost":{"input":0,"output":0}},
+		"kimi-k2.6":{"id":"kimi-k2.6","cost":{"input":0.6,"output":2.5}}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	body := `{"model":"%s","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Bash","parameters":{"type":"object"}}}]}`
+	for i, m := range []string{"zen/big-pickle", "zen/nemo-zero", "zen/kimi-k2.6"} {
+		zenSend(t, s, "/v1/chat/completions", strings.Replace(body, "%s", m, 1))
+		sent := got["opencode.ai"][i]
+		free := i < 2
+		if n := strings.Join(toolNames(sent), ","); (n == "bash,read") != free {
+			t.Errorf("%s: tools %s", m, n)
+		}
+		if (sent["stream"] == true) != free {
+			t.Errorf("%s: stream %v", m, sent["stream"])
+		}
+	}
+}
+
 // A request that searches is asked in rounds (searchReply): each round's
 // reply comes back with the client's names and without a stub's call.
 func TestZenFreeSearchRounds(t *testing.T) {
@@ -226,5 +259,41 @@ func TestZenFreeSearchRounds(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "hi,Bash,{},tool" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// Since mid-October 2026 Zen's free tier answers at the inference API's
+// URL alone, and refuses bash or read offered with no parameters (c9cu on
+// Discord: Muse Spark 1.3 free 403 FreeTierError again): a free model is
+// asked at /inference/v1 with stubs that take OpenCode's own parameters,
+// and a paid one stays at the provider's /zen/v1.
+func TestZenFreeAtInferenceURL(t *testing.T) {
+	s, _ := zenServer(t, chatSSE("hi", "", ""))
+	var paths []string
+	var sent []map[string]any
+	s.client = &http.Client{Transport: countTransport(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		paths, sent = append(paths, r.URL.Host+r.URL.Path), append(sent, m)
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(chatSSE("hi", "", "")))}, nil
+	})}
+	zenSend(t, s, "/v1/chat/completions", `{"model":"zen/mimo-v2.6-flash-free","messages":[{"role":"user","content":"hi"}]}`)
+	zenSend(t, s, "/v1/chat/completions", `{"model":"zen/kimi-k2.6","messages":[{"role":"user","content":"hi"}]}`)
+	if len(paths) != 2 || paths[0] != "opencode.ai/inference/v1/chat/completions" || paths[1] != "opencode.ai/zen/v1/chat/completions" {
+		t.Fatalf("paths %v", paths)
+	}
+	tools, _ := sent[0]["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools %v", sent[0]["tools"])
+	}
+	for _, tl := range tools {
+		f, _ := tl.(map[string]any)["function"].(map[string]any)
+		ps, _ := f["parameters"].(map[string]any)
+		if props, _ := ps["properties"].(map[string]any); len(props) == 0 {
+			t.Fatalf("stub %v takes no parameter", f["name"])
+		}
 	}
 }

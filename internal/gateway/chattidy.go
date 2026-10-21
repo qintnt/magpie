@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"strings"
 )
 
@@ -41,9 +42,15 @@ import (
 // reasoning_content, as other upstreams send it, and the text to a string
 // content.
 //
+// And an upstream that sometimes sends a tool call's first fragment with
+// no id (OpenCode Zen's free DeepSeek) has the agent keep the call as "",
+// which a strict upstream it is sent to later turns away (#2611): such a
+// fragment is given an id, and a later fragment's empty one is left out.
+//
 // Lines pass whole, as they came, unless one has any of them.
 type chatTidy struct {
 	buf []byte
+	ids streamCallIDs
 }
 
 var (
@@ -53,6 +60,7 @@ var (
 	emptyToolCalls    = []byte(`"tool_calls":[]`)
 	contentParts      = []byte(`"content":[`)
 	contentPartsSpace = []byte(`"content": [`)
+	toolCallsField    = []byte(`"tool_calls"`)
 )
 
 // write takes what was read and gives back what to send on: every line
@@ -63,19 +71,19 @@ func (t *chatTidy) write(b []byte) []byte {
 	if i < 0 {
 		return nil
 	}
-	out := tidyLines(t.buf[:i+1])
+	out := t.lines(t.buf[:i+1])
 	t.buf = append(t.buf[:0], t.buf[i+1:]...)
 	return out
 }
 
 // flush is what's left once the stream ends.
 func (t *chatTidy) flush() []byte {
-	out := tidyLines(t.buf)
+	out := t.lines(t.buf)
 	t.buf = nil
 	return out
 }
 
-func tidyLines(b []byte) []byte {
+func (t *chatTidy) lines(b []byte) []byte {
 	if !needsTidy(b) {
 		return append([]byte(nil), b...)
 	}
@@ -87,7 +95,7 @@ func tidyLines(b []byte) []byte {
 		} else {
 			b = nil
 		}
-		out = append(out, tidyLine(line)...)
+		out = append(out, t.line(line)...)
 	}
 	return out
 }
@@ -100,10 +108,14 @@ func needsTidy(line []byte) bool {
 		bytes.Contains(line, emptyToolName) ||
 		bytes.Contains(line, emptyToolCalls) ||
 		bytes.Contains(line, contentParts) ||
-		bytes.Contains(line, contentPartsSpace)
+		bytes.Contains(line, contentPartsSpace) ||
+		bytes.Contains(line, toolCallsField)
 }
 
-func tidyLine(line []byte) []byte {
+// tidyLine mends one line as the first of a stream.
+func tidyLine(line []byte) []byte { return (&chatTidy{}).line(line) }
+
+func (t *chatTidy) line(line []byte) []byte {
 	if !needsTidy(line) {
 		return line
 	}
@@ -114,21 +126,21 @@ func tidyLine(line []byte) []byte {
 		return line
 	}
 	var chunk map[string]json.RawMessage
-	if json.Unmarshal(data, &chunk) != nil {
+	if decodeJSON(data, &chunk) != nil {
 		return line
 	}
 	var choices []map[string]json.RawMessage
-	if json.Unmarshal(chunk["choices"], &choices) != nil {
+	if decodeJSON(chunk["choices"], &choices) != nil {
 		return line
 	}
 	changed := false
-	for _, c := range choices {
+	for k, c := range choices {
 		if string(c["finish_reason"]) == `""` {
 			c["finish_reason"] = json.RawMessage("null")
 			changed = true
 		}
 		var delta map[string]json.RawMessage
-		if json.Unmarshal(c["delta"], &delta) != nil {
+		if decodeJSON(c["delta"], &delta) != nil {
 			continue
 		}
 		inDelta := flattenContent(delta, false)
@@ -140,6 +152,15 @@ func tidyLine(line []byte) []byte {
 			delete(delta, "tool_calls")
 			inDelta = true
 		} else if ok {
+			if t.ids == nil {
+				t.ids = streamCallIDs{}
+			}
+			choice := k
+			decodeJSON(c["index"], &choice)
+			if mended, chg := t.ids.mend(choice, calls); chg {
+				calls, delta["tool_calls"] = mended, mended
+				inDelta = true
+			}
 			if mended, chg := withoutEmptyNames(calls); chg {
 				delta["tool_calls"] = mended
 				inDelta = true
@@ -167,13 +188,13 @@ func tidyLine(line []byte) []byte {
 // keeps it.
 func withoutEmptyNames(raw json.RawMessage) (json.RawMessage, bool) {
 	var calls []map[string]json.RawMessage
-	if json.Unmarshal(raw, &calls) != nil {
+	if decodeJSON(raw, &calls) != nil {
 		return raw, false
 	}
 	changed := false
 	for _, call := range calls {
 		var fn map[string]json.RawMessage
-		if json.Unmarshal(call["function"], &fn) != nil {
+		if decodeJSON(call["function"], &fn) != nil {
 			continue
 		}
 		if string(fn["name"]) != `""` {
@@ -206,7 +227,7 @@ func partsText(raw json.RawMessage) (text, think string, ok bool) {
 		Text     string          `json:"text"`
 		Thinking json.RawMessage `json:"thinking"`
 	}
-	if json.Unmarshal(raw, &parts) != nil {
+	if decodeJSON(raw, &parts) != nil {
 		return "", "", false
 	}
 	var tb, kb strings.Builder
@@ -217,14 +238,14 @@ func partsText(raw json.RawMessage) (text, think string, ok bool) {
 		case "thinking":
 			// Mistral's is a list of text parts; a plain string is taken too
 			var s string
-			if json.Unmarshal(p.Thinking, &s) == nil {
+			if decodeJSON(p.Thinking, &s) == nil {
 				kb.WriteString(s)
 				continue
 			}
 			var inner []struct {
 				Text string `json:"text"`
 			}
-			json.Unmarshal(p.Thinking, &inner)
+			decodeJSON(p.Thinking, &inner)
 			for _, in := range inner {
 				kb.WriteString(in.Text)
 			}
@@ -249,7 +270,7 @@ func flattenContent(m map[string]json.RawMessage, whole bool) bool {
 	}
 	if think != "" {
 		var had string
-		json.Unmarshal(m["reasoning_content"], &had)
+		decodeJSON(m["reasoning_content"], &had)
 		m["reasoning_content"], _ = json.Marshal(had + think)
 	}
 	return true
@@ -257,10 +278,15 @@ func flattenContent(m map[string]json.RawMessage, whole bool) bool {
 
 // chatWhole mends a Chat Completions reply that came whole, not streamed:
 // a message whose content is typed parts (Mistral's thinking, #483) goes
-// on with a string content and its thinking in reasoning_content. It is
-// held until it ends; any other reply passes byte for byte.
+// on with a string content and its thinking in reasoning_content, and,
+// when the request offered tools (names), calls the model wrote into its
+// text are made the calls they are, as textCallTidy makes them in a
+// stream (#1845), and a call the upstream gave no id is given one, as
+// chatTidy gives it in a stream (#2611). It is held until it ends; any
+// other reply passes byte for byte.
 type chatWhole struct {
-	buf []byte
+	names map[string]bool
+	buf   []byte
 }
 
 func (t *chatWhole) write(b []byte) []byte {
@@ -271,31 +297,44 @@ func (t *chatWhole) write(b []byte) []byte {
 func (t *chatWhole) flush() []byte {
 	b := t.buf
 	t.buf = nil
-	if !bytes.Contains(b, contentParts) && !bytes.Contains(b, contentPartsSpace) {
+	parts := bytes.Contains(b, contentParts) || bytes.Contains(b, contentPartsSpace)
+	if !parts && !mayWriteCalls(b, t.names) && !bytes.Contains(b, toolCallsField) {
 		return b
 	}
 	var reply map[string]json.RawMessage
-	if json.Unmarshal(b, &reply) != nil {
+	if decodeJSON(b, &reply) != nil {
 		return b
 	}
 	var choices []map[string]json.RawMessage
-	if json.Unmarshal(reply["choices"], &choices) != nil {
+	if decodeJSON(reply["choices"], &choices) != nil {
 		return b
 	}
 	changed := false
 	for _, c := range choices {
 		var msg map[string]json.RawMessage
-		if json.Unmarshal(c["message"], &msg) != nil || !flattenContent(msg, true) {
+		if decodeJSON(c["message"], &msg) != nil {
 			continue
 		}
-		c["message"], _ = json.Marshal(msg)
+		mended := parts && flattenContent(msg, true)
+		// a call the upstream gave no id (#2611)
+		mended = wholeCallIDs(msg) || mended
+		if wrote, called := wholeTextCalls(msg, t.names); wrote {
+			if called {
+				c["finish_reason"] = json.RawMessage(`"tool_calls"`)
+			}
+			mended = true
+		}
+		if !mended {
+			continue
+		}
+		c["message"], _ = marshalPlain(msg)
 		changed = true
 	}
 	if !changed {
 		return b
 	}
-	reply["choices"], _ = json.Marshal(choices)
-	nb, err := json.Marshal(reply)
+	reply["choices"], _ = marshalPlain(choices)
+	nb, err := marshalPlain(reply)
 	if err != nil {
 		return b
 	}
@@ -314,7 +353,7 @@ var messageReasoning = []string{"reasoning_content", "reasoning", "reasoning_det
 func reasoningText(m map[string]json.RawMessage) string {
 	for _, f := range messageReasoning[:2] {
 		var s string
-		if json.Unmarshal(m[f], &s) == nil && s != "" {
+		if decodeJSON(m[f], &s) == nil && s != "" {
 			return s
 		}
 	}
@@ -322,7 +361,7 @@ func reasoningText(m map[string]json.RawMessage) string {
 		Text    string `json:"text"`
 		Summary string `json:"summary"`
 	}
-	json.Unmarshal(m["reasoning_details"], &details)
+	decodeJSON(m["reasoning_details"], &details)
 	var b strings.Builder
 	for _, d := range details {
 		if d.Text != "" {
@@ -332,6 +371,195 @@ func reasoningText(m map[string]json.RawMessage) string {
 		}
 	}
 	return b.String()
+}
+
+// noReasoning is the reasoning_content a tool call goes to an upstream
+// that wants it back (chatReplaysReasoning) with, when the client has none
+// for it: a turn another model made, or one whose thinking the client
+// didn't keep. DeepSeek turns the whole request away when a tool call of
+// the turn being continued has none ("The `reasoning_content` in the
+// thinking mode must be passed back to the API", #1462). Its Chat API
+// takes an empty one, but a relay that leaves empty fields out would send
+// none, and its Responses API turns an empty reasoning_text away, so it is
+// a space.
+const noReasoning = " "
+
+// withReasoningOnToolTurns gives each assistant message of a Chat request
+// that has tool calls, or that follows a tool message of its turn, and no
+// reasoning_content one: the thinking it sent back in another field
+// (reasoning, reasoning_details), else noReasoning. DeepSeek turns away a
+// reply after a tool result with none as it does a call (checked against
+// api.deepseek.com on 2026-10-12, #1822). A message with reasoning_content
+// of its own keeps it, any other reply is left as it is (DeepSeek doesn't
+// ask for its thinking), and a body with no tool calls comes back byte for
+// byte.
+func withReasoningOnToolTurns(body []byte) []byte {
+	afterTool := false
+	return editMessages(body, []string{"tool_calls"}, func(m map[string]json.RawMessage) bool {
+		var role string
+		var calls []json.RawMessage
+		decodeJSON(m["role"], &role)
+		switch role {
+		case "tool":
+			afterTool = true
+		case "user":
+			afterTool = false
+		}
+		if raw, ok := m["tool_calls"]; ok && decodeJSON(raw, &calls) != nil {
+			return false
+		}
+		if role != "assistant" || len(calls) == 0 && !afterTool {
+			return false
+		}
+		var own *string
+		if decodeJSON(m["reasoning_content"], &own) == nil && own != nil {
+			return false
+		}
+		think := reasoningText(m)
+		if think == "" {
+			think = noReasoning
+		}
+		m["reasoning_content"], _ = marshalPlain(think)
+		return true
+	})
+}
+
+// silentAssistantsOut is withoutSilentAssistants for a Chat request
+// relayed as the client sent it (#2599): an agent that speaks Chat keeps
+// the turn it cut off as {"role":"assistant","content":""} (or null, with
+// reasoning_content alone) and sends it again on every later turn. A body
+// without such a turn comes back byte for byte.
+func silentAssistantsOut(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"assistant"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if decodeJSON(body, &q) != nil || !anySilentAssistant(q["messages"]) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(q["messages"]))
+	dec.UseNumber()
+	var msgs []map[string]any
+	if dec.Decode(&msgs) != nil {
+		return body
+	}
+	msgs, changed := withoutSilentAssistants(msgs)
+	if !changed {
+		return body
+	}
+	q["messages"], _ = marshalPlain(msgs)
+	nb, err := marshalPlain(q)
+	if err != nil {
+		return body
+	}
+	return nb
+}
+
+// anySilentAssistant says whether a Chat request's messages hold a turn
+// silentAssistant leaves out, decoding only the assistant turns to see.
+// silentAssistantsOut runs on every attempt of every Chat request relayed
+// as sent, and almost none has such a turn: decoding every message to
+// look made it the gateway's largest allocation after the body itself
+// (~4 MB a request for a 1.5 MB conversation, yg6888 on X).
+func anySilentAssistant(msgs json.RawMessage) bool {
+	if len(msgs) == 0 || msgs[0] != '[' { // valid: decodeJSON checked the body it is in
+		return false
+	}
+	found := false
+	eachElement(msgs, func(el []byte) bool {
+		if el[0] != '{' {
+			return true
+		}
+		assistant, said := false, false
+		eachMember(el, func(key, val []byte) bool {
+			switch {
+			case jsonStringIs(key, "role"):
+				assistant = jsonStringIs(val, "assistant")
+			case jsonStringIs(key, "content"):
+				said = textSaysSomething(val)
+			}
+			return true
+		})
+		if !assistant || said {
+			return true // a turn with text in it is never left out
+		}
+		dec := json.NewDecoder(bytes.NewReader(el))
+		dec.UseNumber()
+		var m map[string]any
+		found = dec.Decode(&m) == nil && silentAssistant(m)
+		return !found
+	})
+	return found
+}
+
+// textSaysSomething says whether q, a valid JSON value, is a string with
+// an ASCII character in it that isn't a space: text strings.TrimSpace
+// leaves. Escapes are passed over, so "\n" and an escaped U+3000 say
+// nothing here, and what it can't tell is false, for silentAssistant to
+// look at.
+func textSaysSomething(q []byte) bool {
+	if len(q) < 2 || q[0] != '"' {
+		return false
+	}
+	for i := 1; i < len(q)-1; i++ {
+		switch c := q[i]; {
+		case c == '\\':
+			if q[i+1] == 'u' {
+				i += 5
+			} else {
+				i++
+			}
+		case c > ' ' && c < 0x7f:
+			return true
+		}
+	}
+	return false
+}
+
+// jsonStringIs says whether q, a JSON value, is the string s, unquoting
+// only a string with an escape in it.
+func jsonStringIs(q []byte, s string) bool {
+	if len(q) == len(s)+2 && q[0] == '"' && string(q[1:len(q)-1]) == s {
+		return true
+	}
+	if len(q) == 0 || q[0] != '"' || bytes.IndexByte(q, '\\') < 0 {
+		return false
+	}
+	u, ok := unquoteJSON(q)
+	return ok && u == s
+}
+
+// reasoningDetailsAsContent leaves reasoning_details out of every message
+// of a Chat request, its thinking kept in reasoning_content when the
+// message has none: Kimi's API turns reasoning_details away in whatever
+// shape it comes, OpenRouter's reasoning.text with a stream's index in it
+// (as another vendor's turn has it) or without ("the reasoning_details at
+// position 2 entry 0 must not contain streaming index", "… has an invalid
+// type", #1765), and takes reasoning_content.
+func reasoningDetailsAsContent(body []byte) []byte {
+	return editMessages(body, []string{"reasoning_details"}, func(m map[string]json.RawMessage) bool {
+		if _, ok := m["reasoning_details"]; !ok {
+			return false
+		}
+		var own string
+		if decodeJSON(m["reasoning_content"], &own) != nil || own == "" {
+			if think := reasoningText(m); think != "" {
+				m["reasoning_content"], _ = marshalPlain(think)
+			}
+		}
+		delete(m, "reasoning_details")
+		return true
+	})
+}
+
+// withoutMessageReasoning leaves the thinking fields an upstream refused
+// out of every message of a Chat request; reasoning_details' thinking
+// stays in reasoning_content unless that was refused too.
+func withoutMessageReasoning(body []byte, fields []string) []byte {
+	if slices.Contains(fields, "reasoning_details") && !slices.Contains(fields, "reasoning_content") {
+		body = reasoningDetailsAsContent(body)
+	}
+	return withoutMessageFields(body, fields...)
 }
 
 // editMessages hands each message of a Chat request whose JSON names any
@@ -347,17 +575,17 @@ func editMessages(body []byte, fields []string, edit func(m map[string]json.RawM
 		return body
 	}
 	var q map[string]json.RawMessage
-	if json.Unmarshal(body, &q) != nil {
+	if decodeJSON(body, &q) != nil {
 		return body
 	}
 	var msgs []json.RawMessage
-	if json.Unmarshal(q["messages"], &msgs) != nil {
+	if decodeJSON(q["messages"], &msgs) != nil {
 		return body
 	}
 	changed := false
 	for i, raw := range msgs {
 		var m map[string]json.RawMessage
-		if json.Unmarshal(raw, &m) != nil || !edit(m) {
+		if decodeJSON(raw, &m) != nil || !edit(m) {
 			continue
 		}
 		if nb, err := marshalPlain(m); err == nil {
@@ -411,7 +639,7 @@ func mistralThinking(body []byte) []byte {
 			delete(m, f)
 		}
 		var role string
-		json.Unmarshal(m["role"], &role)
+		decodeJSON(m["role"], &role)
 		if think == "" || role != "assistant" {
 			return true
 		}
@@ -422,9 +650,9 @@ func mistralThinking(body []byte) []byte {
 		var list []json.RawMessage
 		var s string
 		switch {
-		case len(c) > 0 && c[0] == '[' && json.Unmarshal(c, &list) == nil:
+		case len(c) > 0 && c[0] == '[' && decodeJSON(c, &list) == nil:
 			parts = append(parts, list...)
-		case json.Unmarshal(c, &s) == nil && s != "":
+		case decodeJSON(c, &s) == nil && s != "":
 			text, _ := marshalPlain(map[string]string{"type": "text", "text": s})
 			parts = append(parts, text)
 		}

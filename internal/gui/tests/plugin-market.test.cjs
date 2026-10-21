@@ -96,12 +96,14 @@ function server(lang, asked) {
 }
 
 const L = {
-  en: { tab: "Plugins", ours: "magpie community", install: "Install", soon: "Coming soon", signIn: "Sign in", onNpm: "On npm",
+  en: { tab: "Plugins", ours: "Subscriptions", install: "Install", soon: "Coming soon", signIn: "Sign in", onNpm: "On npm",
     installed: "Installed", failed: /Didn't load: Cannot find module/, update: "Update", remove: "Remove", moreTile: "More in Plugins",
-    lookFor: "look for a plugin", week: "48k/week", readme: "Install", signing: "GitHub Copilot" },
-  zh: { tab: "插件", ours: "magpie 社区", install: "安装", soon: "即将上线", signIn: "登录", onNpm: "npm 上的插件",
+    lookFor: "look for a plugin", week: "48k/week", readme: "Install", signing: "GitHub Copilot",
+    replaces: "Replaces built-in", replacesWhy: /sign-in to this subscription is deprecated: this plugin takes its place/ },
+  zh: { tab: "插件", ours: "订阅", install: "安装", soon: "即将上线", signIn: "登录", onNpm: "npm 上的插件",
     installed: "已安装", failed: /没有加载成功：Cannot find module/, update: "更新", remove: "移除", moreTile: "插件中还有更多",
-    lookFor: "找找插件", week: "48k/周", readme: "Install", signing: "GitHub Copilot" },
+    lookFor: "找找插件", week: "48k/周", readme: "Install", signing: "GitHub Copilot",
+    replaces: "替代内置", replacesWhy: /此订阅登录已弃用：由此插件接替/ },
 };
 
 const shot = async (loc, name) => {
@@ -145,6 +147,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.doesNotMatch(await view.innerText(), /OpenCode 社区|OpenCode's community/);
         assert.equal(await view.locator('.pm-card[data-pkg="@magpie-community/opencode-qoder-auth"] .pm-act').innerText(), w.soon);
         assert.ok(await view.locator('.pm-card[data-pkg="@magpie-community/opencode-qoder-auth"] .pm-act').isDisabled());
+        // a plugin that takes a deprecated built-in's place says so, not
+        // that magpie still has it too (molvqingtai on Discord: a new
+        // user can't add the built-in at all)
+        const replaces = view.locator('.pm-card[data-pkg="@magpie-community/opencode-zed-auth"] .pm-chip.soft');
+        assert.equal((await replaces.innerText()).trim(), w.replaces);
+        assert.match(await replaces.getAttribute("title"), w.replacesWhy);
         await shot(view, `plugins-discover-${engine}-${lang}`);
         await view.locator(".pm-find input").fill("copilot");
         const copilot = view.locator('.pm-card[data-pkg="opencode-copilot-auth"]');
@@ -209,7 +217,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await q.fill("");
 
         // Installed: why one didn't load, an update, a removal
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const rows = view.locator(".pm-row");
         await rows.first().waitFor();
         assert.equal(await rows.count(), 2);
@@ -222,6 +230,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await cp.locator(".pm-chip.up").waitFor({ state: "detached" });
         assert.deepEqual(asked.find(([k]) => k === "upgrade")[1], { spec: "opencode-copilot-auth" });
         await rows.filter({ hasText: "opencode-broken" }).locator("button", { hasText: w.remove }).click();
+        assert.deepEqual(asked.filter(([k]) => k === "remove"), [], "Remove waits for confirmation");
+        await page.locator("dialog.action-confirm[open] button").last().click();
         await page.waitForFunction(() => document.querySelectorAll("#view-plugins .pm-row").length === 1);
         assert.equal(await view.evaluate((e) => e.scrollTop), top, "a click doesn't move the page");
 

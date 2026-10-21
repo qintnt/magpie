@@ -110,8 +110,13 @@ func TestSignInPage(t *testing.T) {
 func TestNothingToSignIn(t *testing.T) {
 	home(t)
 	f := mcpauthtest.New(t)
-	if _, err := mcpauth.Start(t.Context(), "open", f.Server.URL+"/.well-known/oauth-protected-resource/mcp"); err == nil {
+	_, err := mcpauth.Start(t.Context(), "open", f.Server.URL+"/.well-known/oauth-protected-resource/mcp")
+	if err == nil {
 		t.Fatal("signed in to a server that asks for none")
+	}
+	// said to work as it is, not as a failure to find the sign-in
+	if !errors.Is(err, mcpauth.ErrNoSignIn) || !strings.Contains(err.Error(), "already works without signing in") {
+		t.Fatalf("error %v", err)
 	}
 }
 
@@ -202,5 +207,130 @@ func TestRenewRefusedForGood(t *testing.T) {
 	f.SignIn(t, "neon")
 	if st := mcpauth.StatusOf("neon", f.URL); !st.SignedIn || st.Dead {
 		t.Fatalf("signed in again: %+v", st)
+	}
+}
+
+// A token endpoint that takes no public client and no client_secret_post
+// is registered with and signed in to by client_secret_basic, whatever it
+// lists first (RFC 8414's list has no order of preference): one listing
+// private_key_jwt or tls_client_auth before it was asked to register
+// magpie for that, which it can't do, and turned the sign-in away.
+func TestSignInBySecretBasic(t *testing.T) {
+	home(t)
+	for _, methods := range [][]string{
+		{"private_key_jwt", "client_secret_basic"},
+		{"tls_client_auth", "client_secret_jwt", "client_secret_basic"},
+		{"client_secret_basic"},
+	} {
+		f := mcpauthtest.New(t)
+		f.AuthMethods = methods
+		f.SignIn(t, "neon")
+		if got := f.Registered[len(f.Registered)-1]["token_endpoint_auth_method"]; got != "client_secret_basic" {
+			t.Fatalf("%v: registered for %v", methods, got)
+		}
+		if r, _ := mcpauth.Get("neon"); r.AuthMethod != "client_secret_basic" || r.Secret == "" || r.Access == "" || f.Exchanged != 1 {
+			t.Fatalf("%v: record %+v, exchanged %d", methods, r, f.Exchanged)
+		}
+	}
+	// client_secret_post is still taken over basic where both are
+	f := mcpauthtest.New(t)
+	f.AuthMethods = []string{"private_key_jwt", "client_secret_basic", "client_secret_post"}
+	f.SignIn(t, "kc")
+	if r, _ := mcpauth.Get("kc"); r.AuthMethod != "client_secret_post" || f.Exchanged != 1 {
+		t.Fatalf("both: record %+v", r)
+	}
+}
+
+// A server that registers magpie for a method magpie can't send — RFC
+// 7591's registration response lets it assign another of the methods it
+// supports than the one asked for — is said no at the registration,
+// before the browser is opened, not at the code exchange after it.
+func TestSignInRefusesAssignedSecretJWT(t *testing.T) {
+	home(t)
+	f := mcpauthtest.New(t)
+	f.AuthMethods = []string{"client_secret_jwt", "client_secret_basic"}
+	f.Assign = "client_secret_jwt"
+	st, err := mcpauth.Start(t.Context(), "neon", f.URL)
+	if err != nil {
+		if !strings.Contains(err.Error(), "can't do") {
+			t.Fatalf("signing in to a server that registered magpie for client_secret_jwt: %v", err)
+		}
+		return
+	}
+	mcpauth.Cancel(st.ID)
+	t.Fatalf("the sign-in page was opened for a client magpie can't authenticate as: %s", st.URL)
+}
+
+// An assignment magpie can do is taken, both ways round (#1490): a client
+// that asked none and was given a secret for basic or post sends it as
+// assigned, and one that asked for a secret method and was registered
+// public, with no secret, sends none; at the code exchange and at a
+// renewal both, which the fake's token endpoint checks against what it
+// assigned.
+func TestSignInTakesAnAssignedMethodItCanDo(t *testing.T) {
+	home(t)
+	for _, c := range []struct {
+		listed []string
+		assign string
+	}{
+		{[]string{"none", "client_secret_basic"}, "client_secret_basic"},
+		{[]string{"none", "client_secret_post"}, "client_secret_post"},
+		{[]string{"client_secret_post"}, "none"},
+		{[]string{"client_secret_basic"}, "client_secret_post"},
+	} {
+		f := mcpauthtest.New(t)
+		f.AuthMethods, f.Assign = c.listed, c.assign
+		f.SignIn(t, "neon")
+		r, _ := mcpauth.Get("neon")
+		if r.AuthMethod != c.assign || (r.Secret == "") != (c.assign == "none") || r.Access == "" || f.Exchanged != 1 {
+			t.Fatalf("%v assigned %s: record %+v, exchanged %d", c.listed, c.assign, r, f.Exchanged)
+		}
+		f.Revoke()
+		if tok, err := mcpauth.Renew(t.Context(), "neon", r.Access); err != nil || tok == r.Access || f.Refreshed != 1 {
+			t.Fatalf("%v assigned %s: renewed to %q, %v (renewals %d)", c.listed, c.assign, tok, err, f.Refreshed)
+		}
+	}
+}
+
+// An authorization server that is an OpenID provider, as Vercel's is, gives
+// a refresh token only to a sign-in that asks for offline_access, while the
+// server names only "openid": magpie asks for it too when the authorization
+// server offers it, so the hour-long token is renewed rather than the
+// sign-in running out (#615).
+func TestSignInAsksForOfflineAccess(t *testing.T) {
+	home(t)
+	f := mcpauthtest.New(t)
+	f.OpenID = true
+	f.ExpiresIn = 60
+	st, err := mcpauth.Start(t.Context(), "vercel", f.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(st.URL)
+	if q := u.Query().Get("scope"); q != "openid offline_access" {
+		t.Errorf("scope %q", q)
+	}
+	mcpauth.Cancel(st.ID)
+	f.SignIn(t, "vercel")
+	old, _ := mcpauth.Get("vercel")
+	if old.Refresh == "" {
+		t.Errorf("no refresh token: %+v", old)
+	}
+	tok, err := mcpauth.Token(t.Context(), "vercel")
+	if err != nil || tok == old.Access || f.Refreshed != 1 {
+		t.Fatalf("renewing: %q %v, renewed %d", tok, err, f.Refreshed)
+	}
+	if st := mcpauth.StatusOf("vercel", f.URL); st.Dead {
+		t.Fatal("the sign-in ran out")
+	}
+	// a server whose authorization server doesn't offer it isn't asked for it
+	g := mcpauthtest.New(t)
+	st, err = mcpauth.Start(t.Context(), "neon", g.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mcpauth.Cancel(st.ID)
+	if u, _ := url.Parse(st.URL); u.Query().Get("scope") != "read write" {
+		t.Errorf("scope %q", u.Query().Get("scope"))
 	}
 }

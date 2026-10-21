@@ -2,11 +2,14 @@ package library
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/yetone/magpie/internal/desktopdir"
 )
 
 // desktopAccount makes a skills-plugin for one of Claude Desktop's
@@ -40,6 +43,37 @@ func desktopEntries(t *testing.T, root string) map[string]desktopEntry {
 		out[e.SkillID] = e
 	}
 	return out
+}
+
+func TestDesktopSkillScanErrorPreservesCopy(t *testing.T) {
+	h := sandbox(t)
+	p, _ := desktopFiles(t, h)
+	write(t, p, `{}`)
+	root := desktopAccount(t, filepath.Dir(p), "org", "acct", `{"skills":[]}`)
+	src := filepath.Join(h, "src/skills")
+	skill(t, filepath.Join(src, "pdf"), "pdf", "Read PDFs")
+	ok(t)(InstallSkills(src, []string{"pdf"}, []string{"claude-desktop"}))
+	cp := filepath.Join(root, "skills/pdf")
+	write(t, filepath.Join(cp, "scripts/run.sh"), "echo mine\n")
+	manifest := read(t, filepath.Join(root, desktopManifest))
+	blocked := filepath.Join(cp, "scripts")
+	blockSkillSubtree(t, h, blocked)
+	r, err := Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Problems) != 1 || r.Problems[0].Agent != "claude-desktop" || !strings.Contains(r.Problems[0].Error, blocked) {
+		t.Fatalf("unreadable Desktop copy wasn't reported: %+v", r.Problems)
+	}
+	if got := read(t, filepath.Join(root, desktopManifest)); got != manifest {
+		t.Fatalf("unreadable Desktop copy's manifest changed: %s", got)
+	}
+	if err := os.Chmod(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(cp, "scripts/run.sh")); got != "echo mine\n" {
+		t.Fatalf("unreadable Desktop copy's edit was replaced: %q", got)
+	}
 }
 
 // #638: the library gives Claude Desktop's Cowork skills: a copy in every
@@ -130,8 +164,13 @@ func TestClaudeDesktopSkills(t *testing.T) {
 	if len(es) != 3 || es["frontend-design"].CreatorType != "anthropic" || es["frontend-design"].Enabled || es["test"].Description != "Test" {
 		t.Errorf("Desktop's own entries changed: %+v", es)
 	}
-	if _, ok := desktopEntries(t, b)["pdf"].UpdatedAt.(float64); !ok {
-		t.Errorf("a manifest of millisecond times got another kind: %+v", desktopEntries(t, b)["pdf"])
+	// #863: a skill's updatedAt is an ISO time even where lastUpdated is
+	// milliseconds, which stays so
+	if u, ok := desktopEntries(t, b)["pdf"].UpdatedAt.(string); !ok || !strings.HasSuffix(u, "Z") {
+		t.Errorf("updatedAt isn't an ISO time: %+v", desktopEntries(t, b)["pdf"])
+	}
+	if !strings.Contains(read(t, filepath.Join(b, desktopManifest)), `"lastUpdated": 17`) {
+		t.Errorf("lastUpdated's milliseconds changed kind:\n%s", read(t, filepath.Join(b, desktopManifest)))
 	}
 	// the other keys of a manifest, and its layout, stay
 	if s := read(t, filepath.Join(a, desktopManifest)); !strings.HasPrefix(s, "{\n  \"lastUpdated\"") {
@@ -205,5 +244,155 @@ func TestClaudeDesktopSkills(t *testing.T) {
 	ok(t)(Sync())
 	if _, err := os.Stat(filepath.Join(b, "skills", "pdf", "SKILL.md")); err != nil {
 		t.Error(err)
+	}
+
+	// #863: an updatedAt magpie wrote as milliseconds before is written as
+	// an ISO time at the next sync, the same moment, the entry's other keys
+	// and Desktop's own entries as they were
+	write(t, m, strings.Replace(read(t, m), `"skills": [`, `"skills": [{"skillId":"ponytail","name":"ponytail","syncManaged":true,"updatedAt":1759536000000,"enabled":true},`, 1))
+	ok(t)(Sync())
+	es = desktopEntries(t, b)
+	if es["ponytail"].UpdatedAt != "2025-10-04T00:00:00.000Z" || !es["ponytail"].SyncManaged || !es["ponytail"].Enabled {
+		t.Errorf("the old entry: %+v\n%s", es["ponytail"], read(t, m))
+	}
+	for id, e := range es {
+		if _, num := e.UpdatedAt.(float64); num {
+			t.Errorf("%s: updatedAt is still a number", id)
+		}
+	}
+	if !strings.Contains(read(t, m), `{"skillId":"ponytail","name":"ponytail","syncManaged":true,"updatedAt":"2025-10-04T00:00:00.000Z","enabled":true}`) {
+		t.Errorf("the entry's keys moved:\n%s", read(t, m))
+	}
+}
+
+// Kilig on Discord: an MSIX Claude Desktop (Windows 10 LTSC) has its
+// claude_desktop_config.json and Cowork's skills in the package's
+// LocalCache\Roaming\Claude, and doesn't see a file written into
+// %APPDATA%\Claude: the library's MCP servers and skills go there.
+func TestClaudeDesktopMSIXLibrary(t *testing.T) {
+	h := sandbox(t)
+	old := desktopdir.OS
+	desktopdir.OS = "windows"
+	t.Cleanup(func() { desktopdir.OS = old })
+	local, roaming := filepath.Join(h, "AppData", "Local"), filepath.Join(h, "AppData", "Roaming")
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("APPDATA", roaming)
+	os.MkdirAll(roaming, 0o755)
+	data := filepath.Join(local, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache", "Roaming", "Claude")
+	write(t, filepath.Join(data, "Local State"), `{}`)
+	root := desktopAccount(t, data, "org", "acct", `{"lastUpdated": "2026-10-01T00:00:00.000Z", "skills": []}`)
+
+	tg := targetByID("claude-desktop")
+	if tg == nil || tg.MCP == nil {
+		t.Fatalf("no Claude Desktop target: %+v", tg)
+	}
+	if want := filepath.Join(data, "claude_desktop_config.json"); tg.MCP.Path != want {
+		t.Errorf("MCP file %s, want %s", tg.MCP.Path, want)
+	}
+	if !slices.Equal(tg.Desktop, []string{root}) {
+		t.Errorf("skills-plugin roots %v, want %s", tg.Desktop, root)
+	}
+}
+
+// bg5eau on X: Claude Desktop 2.31226.1, packaged, reads its 3p mode's
+// file in the real %LOCALAPPDATA%\Claude-3p, an older one in the package's:
+// a server the library gives Desktop goes into each that is there.
+func TestClaudeDesktopMSIXBoth3p(t *testing.T) {
+	h := sandbox(t)
+	old := desktopdir.OS
+	desktopdir.OS = "windows"
+	t.Cleanup(func() { desktopdir.OS = old })
+	local, roaming := filepath.Join(h, "AppData", "Local"), filepath.Join(h, "AppData", "Roaming")
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("APPDATA", roaming)
+	os.MkdirAll(roaming, 0o755)
+	pkg := filepath.Join(local, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache")
+	write(t, filepath.Join(pkg, "Roaming", "Claude", "Local State"), `{}`)
+	pkg3p := filepath.Join(pkg, "Local", "Claude-3p", "claude_desktop_config.json")
+	real3p := filepath.Join(local, "Claude-3p", "claude_desktop_config.json")
+	write(t, pkg3p, `{"deploymentMode": "3p"}`)
+	write(t, real3p, `{"deploymentMode": "3p"}`)
+
+	tg := targetByID("claude-desktop")
+	if tg == nil || tg.MCP == nil || !slices.Equal(tg.MCP.Also, []string{pkg3p, real3p}) {
+		t.Fatalf("claude-desktop target: %+v", tg.MCP)
+	}
+	ok(t)(SaveServer("", Server{Name: "fs", Transport: "stdio", Command: "npx", Agents: []string{"claude-desktop"}}))
+	for _, f := range []string{pkg3p, real3p} {
+		if fs := desktopServers(t, f)["fs"]; fs["command"] != "npx" {
+			t.Errorf("%s: fs is %v", f, fs)
+		}
+	}
+}
+
+// SivanCola (#1896): Claude Desktop's own docx, pdf… (Anthropic's, built
+// in) in the library's way are its own skills, which the page settles by
+// keeping Desktop's, all of them in one go; not writes that failed, and
+// not ones set aside for the library's.
+func TestClaudeDesktopOwnSkillsKept(t *testing.T) {
+	h := sandbox(t)
+	p, _ := desktopFiles(t, h)
+	write(t, p, `{}`)
+	builtIn := []string{"docx", "pdf", "xlsx"}
+	var entries []string
+	for _, n := range builtIn {
+		entries = append(entries, fmt.Sprintf(`{"skillId": %q, "name": %q, "description": "Anthropic's", "creatorType": "anthropic", "syncManaged": true, "updatedAt": "2026-10-01T00:00:00.000Z", "enabled": true}`, n, n))
+	}
+	a := desktopAccount(t, filepath.Dir(p), "org1", "acct1", `{"lastUpdated": "2026-10-01T00:00:00.000Z", "skills": [`+strings.Join(entries, ",")+`]}`)
+	for _, n := range builtIn {
+		write(t, filepath.Join(a, "skills", n, "SKILL.md"), "---\nname: "+n+"\ndescription: Anthropic's\n---\n")
+	}
+	src := filepath.Join(h, "src", "skills")
+	for _, n := range builtIn {
+		skill(t, filepath.Join(src, n), n, "the library's "+n)
+	}
+	r, err := InstallSkills(src, builtIn, []string{"claude", "claude-desktop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own []string
+	for _, pr := range r.Problems {
+		if pr.Agent == "claude-desktop" {
+			if !pr.Own {
+				t.Errorf("Desktop's own %s isn't its own: %+v", pr.What, pr)
+			}
+			own = append(own, pr.What)
+		}
+	}
+	if len(own) != len(builtIn) {
+		t.Fatalf("problems: %+v", r.Problems)
+	}
+	if _, err := UseLibrarySkills(builtIn, "claude-desktop"); err == nil {
+		t.Error("Desktop's built-in skills were set aside for the library's")
+	}
+	if _, err := os.Stat(filepath.Join(a, "skills", "docx", "SKILL.md")); err != nil {
+		t.Errorf("Desktop's own docx is gone: %v", err)
+	}
+	r, err = KeepAgentSkills(builtIn, "claude-desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pr := range r.Problems {
+		t.Errorf("still a problem: %+v", pr)
+	}
+	v, err := Read(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range v.Skills {
+		if slices.Contains(builtIn, s.Name) && (slices.Contains(s.Agents, "claude-desktop") || !slices.Contains(s.Agents, "claude")) {
+			t.Errorf("%s: %v", s.Name, s.Agents)
+		}
+	}
+	// and the next sync doesn't bring them back
+	r, err = Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pr := range r.Problems {
+		t.Errorf("after a sync: %+v", pr)
+	}
+	if s := read(t, filepath.Join(a, "skills", "pdf", "SKILL.md")); !strings.Contains(s, "Anthropic's") {
+		t.Errorf("Desktop's own pdf changed:\n%s", s)
 	}
 }

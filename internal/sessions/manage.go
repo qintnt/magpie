@@ -22,7 +22,11 @@ import (
 //
 // Only the agents whose sessions are files of their own can be deleted:
 // Claude Code's (and Qoder's and WorkBuddy's, kept the same way), Codex's,
-// Pi's, omp's and Cursor CLI's (a chat's folder, its store and meta.json). The agents' indexes are left as they are: Codex's
+// Pi's, omp's, Cursor CLI's (a chat's folder, its store and meta.json) and
+// DeepSeek Harness's (a session's folder, and its listing's cached row).
+// Hermes's and Alma's are rows in a database the agent keeps open and
+// writes, so they are only listed, and so are Cline's, whose sessions.db
+// lists a session whose files are gone. The agents' indexes are left as they are: Codex's
 // session_index.jsonl (names by thread id) and its state database, and
 // Claude Code's history.jsonl (the prompts typed, for the up arrow), are
 // written by the agent while it runs, and a name or a prompt left for a
@@ -37,6 +41,10 @@ type Managed struct {
 	Messages  int   `json:"messages"`
 	Files     int   `json:"files"`
 	Deletable bool  `json:"deletable"`
+	// Codex: the provider the session was made with, and the one its Codex
+	// uses now, whose sessions alone its history lists (#887)
+	Provider     string `json:"provider,omitempty"`
+	UsesProvider string `json:"uses_provider,omitempty"`
 }
 
 // AgentCount is an agent with sessions on this computer, and how many.
@@ -50,7 +58,7 @@ type AgentCount struct {
 // those kept as files of their own, in a layout magpie knows whole.
 func Deletable(agent string) bool {
 	switch agent {
-	case "claude", "qoder", "qoder-cn", "workbuddy", "codex", "pi", "omp", "cursor":
+	case "claude", "qoder", "qoder-cn", "workbuddy", "codebuddy", "codex", "pi", "omp", "cursor", "dsh":
 		return true
 	}
 	return false
@@ -65,13 +73,17 @@ var ErrActive = errors.New("the session was written to in the last minute; it ma
 
 // Agents are the agents with sessions on this computer, by how many.
 func Agents() []AgentCount {
-	dbReadMu.Lock()
-	defer dbReadMu.Unlock()
+	storeMu.RLock()
+	defer storeMu.RUnlock()
 	mu.Lock()
 	defer mu.Unlock()
-	defer closeDBs()
+	defer useDBs()()
+	return agentCounts(allFiles())
+}
+
+func agentCounts(all []file) []AgentCount {
 	n := map[string]map[string]bool{}
-	for _, f := range allFiles() {
+	for _, f := range all {
 		if n[f.agent] == nil {
 			n[f.agent] = map[string]bool{}
 		}
@@ -93,13 +105,96 @@ func Agents() []AgentCount {
 // ListAgent is every session of one agent, the most recently active first,
 // with no limit; one nothing was said in is listed too, to be cleared away.
 func ListAgent(agent string) []Managed {
-	dbReadMu.Lock()
-	defer dbReadMu.Unlock()
+	storeMu.RLock()
+	defer storeMu.RUnlock()
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
-	defer closeDBs()
+	defer useDBs()()
+	return listAgent(agent, allFiles())
+}
+
+// NativeIDs are the ids of every session the agents named keep themselves,
+// by agent: one nothing was said in too, as ListAgent lists it. It tells a
+// gateway session an agent keeps from one only magpie saw. Only the named
+// agents' files are looked at, and of those only the ones whose session id
+// is inside the file are read when they changed.
+func NativeIDs(agents map[string]bool) map[string]map[string]bool {
+	storeMu.RLock()
+	defer storeMu.RUnlock()
+	mu.Lock()
+	defer mu.Unlock()
+	loadCache()
+	defer useDBs()()
+	return nativeIDs(agents, allFiles())
+}
+
+// ManageView is the session management page, read in one pass over every
+// agent's files: the agents with sessions, the ids of the sessions of those
+// asked for (as NativeIDs), and the agent shown with its sessions (as
+// ListAgent).
+type ManageView struct {
+	Agents   []AgentCount
+	Native   map[string]map[string]bool
+	Agent    string
+	Sessions []Managed
+}
+
+// Manage reads the management page. pick, given the counts and the native
+// ids of the agents in native, names the agent to list ("" for none); it
+// runs under the sessions lock and must not call back into this package.
+// Only native's agents and the one picked are read: a change to another
+// agent's sessions waits for a page that shows it (#2776).
+func Manage(native map[string]bool, pick func([]AgentCount, map[string]map[string]bool) string) ManageView {
+	storeMu.RLock()
+	defer storeMu.RUnlock()
+	mu.Lock()
+	defer mu.Unlock()
+	loadCache()
+	defer useDBs()()
 	all := allFiles()
+	v := ManageView{Agents: agentCounts(all), Native: nativeIDs(native, all)}
+	v.Agent = pick(v.Agents, v.Native)
+	if v.Agent != "" {
+		v.Sessions = listAgent(v.Agent, all)
+	}
+	return v
+}
+
+// idInFile says which agents' session ids are read from inside the
+// session's file, not taken from its name (as assemble does).
+func idInFile(agent string) bool {
+	switch agent {
+	case "codex", "pi", "omp", "dsh", "grok", "droid":
+		return true
+	}
+	return false
+}
+
+func nativeIDs(agents map[string]bool, all []file) map[string]map[string]bool {
+	groups := map[string][]file{}
+	var want []file
+	for _, f := range all {
+		if !agents[f.agent] {
+			continue
+		}
+		groups[f.key] = append(groups[f.key], f)
+		if idInFile(f.agent) {
+			want = append(want, f)
+		}
+	}
+	refresh(want, all)
+	out := map[string]map[string]bool{}
+	for a := range agents {
+		out[a] = map[string]bool{}
+	}
+	for _, fs := range groups {
+		out[fs[0].agent][sessionID(fs)] = true
+	}
+	return out
+}
+
+func listAgent(agent string, all []file) []Managed {
 	groups := map[string][]file{}
 	var mine []file
 	for _, f := range all {
@@ -109,13 +204,20 @@ func ListAgent(agent string) []Managed {
 		}
 	}
 	refresh(mine, all)
+	identities := map[string]CodexIdentity(nil)
+	taskTitles := map[codexTaskTitle]string(nil)
+	if agent == "codex" {
+		identities = codexIdentitySnapshot(mine)
+		taskTitles = codexSubagentTaskTitles(mine)
+	}
 	price := pricer()
 	out := []Managed{}
 	for _, fs := range groups {
 		s, _ := assemble(fs, price)
-		if s.Resume == "" && !s.ReadOnly {
-			s.Resume = ResumeCommand(s.Agent, s.ID, s.Cwd)
-		}
+		setSessionCodexIdentity(&s, identities)
+		setSessionCodexTaskTitle(&s, taskTitles)
+		listed(&s)
+		// a WSL distro's too (TJHHHH): moved out over \\wsl.localhost
 		m := Managed{Session: s, Files: len(fs), Deletable: Deletable(agent) && !s.ReadOnly}
 		for _, f := range fs {
 			m.Size += f.size
@@ -127,6 +229,9 @@ func ListAgent(agent string) []Managed {
 		}
 		out = append(out, m)
 	}
+	if agent == "codex" {
+		codexProviders(out, groups)
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if !out[i].Last.Equal(out[j].Last) {
 			return out[i].Last.After(out[j].Last)
@@ -134,6 +239,19 @@ func ListAgent(agent string) []Managed {
 		return out[i].ID < out[j].ID
 	})
 	return out
+}
+
+// listed fills in what assemble leaves out of a session nothing was said
+// in, as ListAgent lists it and Find finds it: how to resume it, and
+// whether its conversation can be read.
+func listed(s *Session) {
+	if s.Resume == "" && !s.ReadOnly {
+		s.Resume = resumeCommand(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
+	}
+	if s.Carry == nil {
+		s.Carry = carries(*s)
+	}
+	s.Transcript = HasTranscript(s.Agent)
 }
 
 // TrashDir is where deleted sessions are kept: <magpie dir>/trash/sessions.
@@ -150,6 +268,9 @@ type Trashed struct {
 	Deleted time.Time `json:"deleted"`
 	Size    int64     `json:"size"`
 	Items   []moved   `json:"items"`
+	// Gateway: a session seen only through magpie's gateway, whose items
+	// are the conversation text magpie recorded of it (gateway_delete.go)
+	Gateway bool `json:"gateway,omitempty"`
 }
 
 // moved is one file or folder of a session moved to the trash: where it
@@ -167,7 +288,9 @@ const manifest = "session.json"
 // Codex session's later segments, its subagents' elsewhere) and, for Claude
 // Code, the file history, todos and environment it keeps by the session's
 // id. A session any file of which was written in the last minute is not
-// touched (ErrActive).
+// touched (ErrActive). One in a WSL distro is moved out of it over
+// \\wsl.localhost the same way, its Claude Code files from the distro's
+// ~/.claude, and Restore puts it back there.
 func Delete(agent, id string) (Trashed, error) {
 	if !Deletable(agent) {
 		return Trashed{}, fmt.Errorf("magpie can't delete %s sessions", agent)
@@ -175,12 +298,12 @@ func Delete(agent, id string) (Trashed, error) {
 	if !safeID.MatchString(id) {
 		return Trashed{}, errors.New("no such session")
 	}
-	dbReadMu.Lock()
-	defer dbReadMu.Unlock()
+	storeMu.Lock()
+	defer storeMu.Unlock()
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
-	defer closeDBs()
+	defer useDBs()()
 	all := allFiles()
 	groups := map[string][]file{}
 	var mine []file
@@ -196,7 +319,7 @@ func Delete(agent, id string) (Trashed, error) {
 	var s Session
 	price := pricer()
 	for _, g := range groups {
-		if one, _ := assemble(g, price); one.ID == id {
+		if one, _ := assembleListed(g, price); one.ID == id {
 			fs, s = g, one
 			break
 		}
@@ -204,7 +327,15 @@ func Delete(agent, id string) (Trashed, error) {
 	if len(fs) == 0 {
 		return Trashed{}, errors.New("no such session")
 	}
+	if s.ReadOnly {
+		return Trashed{}, errors.New("this session is read only")
+	}
 	paths := sessionPaths(agent, id, fs)
+	if len(paths) == 0 {
+		// a stopped distro's listing, of files since gone
+		wslForget(fs)
+		return Trashed{}, errors.New("no such session")
+	}
 	now := time.Now()
 	for _, p := range paths {
 		if recent(p, now) {
@@ -241,6 +372,7 @@ func Delete(agent, id string) (Trashed, error) {
 		delete(cache, f.path)
 	}
 	saveCache()
+	wslForget(fs)
 	return t, nil
 }
 
@@ -265,6 +397,21 @@ func sessionPaths(agent, id string, fs []file) []string {
 		}
 		for _, p := range cursorTranscripts(cwd, id) {
 			add(p)
+		}
+		return out
+	}
+	if agent == "dsh" {
+		// each session's own folder (the parent's and its subagents'), and
+		// the row dsh caches of it for its listing; none at all when one
+		// isn't in a folder of its own, rather than half the session
+		for _, f := range fs {
+			if dshSessionDir(f) == "" {
+				return nil
+			}
+		}
+		for _, f := range fs {
+			add(dshSessionDir(f))
+			add(dshCacheRecord(f.sid))
 		}
 		return out
 	}
@@ -293,6 +440,13 @@ func sessionPaths(agent, id string, fs []file) []string {
 	}
 	if agent == "claude" {
 		dir := ClaudeDir()
+		if fs[0].wsl != "" {
+			// the distro's own ~/.claude
+			if dir = wslHomeOf(fs[0].wsl); dir == "" {
+				return out
+			}
+			dir = filepath.Join(dir, ".claude")
+		}
 		add(filepath.Join(dir, "file-history", id))
 		add(filepath.Join(dir, "session-env", id))
 		todos, _ := filepath.Glob(filepath.Join(dir, "todos", id+"-*.json"))
@@ -362,8 +516,10 @@ func move(from, to string) error {
 	if _, err := os.Lstat(to); err == nil {
 		return fmt.Errorf("%s is already there", to)
 	}
-	if os.Rename(from, to) == nil {
+	if err := os.Rename(from, to); err == nil {
 		return nil
+	} else if !errors.Is(err, crossDeviceErr) {
+		return err
 	}
 	if err := copyAll(from, to); err != nil {
 		os.RemoveAll(to)
@@ -391,7 +547,7 @@ func copyAll(from, to string) error {
 			if err != nil {
 				return err
 			}
-			return os.Symlink(target, dst)
+			return copySymlink(target, dst, fi)
 		}
 		if !fi.Mode().IsRegular() {
 			return nil
@@ -428,6 +584,10 @@ func Trash() []Trashed {
 		}
 		dir := filepath.Dir(p)
 		t.Key = filepath.Base(filepath.Dir(dir)) + "/" + filepath.Base(dir)
+		if t.Gateway {
+			// its text expires, or is cleared, while it waits here
+			t.Size = sizeOf(filepath.Join(dir, "files"))
+		}
 		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Deleted.After(out[j].Deleted) })
@@ -437,7 +597,7 @@ func Trash() []Trashed {
 // trashFolder is a trash key's folder, or "" for a key that isn't one.
 func trashFolder(key string) string {
 	agent, name, ok := strings.Cut(key, "/")
-	if !ok || !Deletable(agent) || name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+	if !ok || (!Deletable(agent) && agent != gatewayTrash) || name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
 		return ""
 	}
 	return filepath.Join(TrashDir(), agent, name)
@@ -480,6 +640,23 @@ func Restore(key string) (Trashed, error) {
 	t.Key = key
 	mu.Lock()
 	defer mu.Unlock()
+	if isGatewayKey(key) {
+		// its items can only be this session's text folders in the store
+		for _, m := range t.Items {
+			if !t.Gateway || m.Name != filepath.Base(m.Name) || m.Name == "" || filepath.Base(m.From) != gatewayIdentity(t.Agent, t.ID) ||
+				filepath.Dir(filepath.Dir(m.From)) != gatewayDir() {
+				return Trashed{}, errors.New("the trash note is damaged")
+			}
+		}
+		if !t.Gateway {
+			return Trashed{}, errors.New("the trash note is damaged")
+		}
+		if err := restoreGateway(dir, t); err != nil {
+			return Trashed{}, err
+		}
+		os.RemoveAll(dir)
+		return t, nil
+	}
 	for _, m := range t.Items {
 		if _, err := os.Lstat(m.From); err == nil {
 			return Trashed{}, fmt.Errorf("%s is there again; nothing was restored", m.From)
@@ -498,5 +675,6 @@ func Restore(key string) (Trashed, error) {
 		}
 	}
 	os.RemoveAll(dir)
+	wslRelistNow(t.Items)
 	return t, nil
 }

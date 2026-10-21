@@ -9,6 +9,7 @@ package provider
 // (gateway/fallback.go).
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -16,10 +17,23 @@ import (
 
 // AccountServes says whether the account or key ref (a signed-in
 // account's name, a key's KeyID) is let serve model: true when it has no
-// list of its own.
+// list of its own, and for a model Codex calls by itself that no list can
+// hold (codexOwnHidden).
 func (p Provider) AccountServes(ref, model string) bool {
 	ms, ok := p.AccountModels[accountKey(ref)]
-	return !ok || len(ms) == 0 || slices.Contains(ms, model)
+	return !ok || len(ms) == 0 || slices.Contains(ms, model) || codexOwnHidden(p, model)
+}
+
+// codexOwnHidden says model is one a Codex account serves that its list
+// of models can't name: codex-auto-review, the model Codex's auto-review
+// of an approval (the guardian) asks for. It is hidden from the
+// provider's models, so an account's list, picked from those, never had
+// it, and a list kept for the big models turned every approval away as
+// "every account barred" once Codex's turns went through magpie's
+// account failover (#1959, parkavenue9639). ChatGPT serves it to every
+// plan, free since 2026-10-06 (#1593).
+func codexOwnHidden(p Provider, model string) bool {
+	return p.Account != nil && p.Account.Agent == "codex" && strings.EqualFold(strings.TrimSpace(model), "codex-auto-review")
 }
 
 // AccountRefs are the provider's accounts, or keys, as AccountModels
@@ -42,6 +56,70 @@ func (p Provider) AccountRefs() []string {
 	for _, l := range Logins(agent) {
 		if !slices.ContainsFunc(out, func(u string) bool { return accountKey(u) == accountKey(l.User) }) {
 			out = append(out, l.User)
+		}
+	}
+	return out
+}
+
+// AccountRef is one of a provider's accounts or keys as a gateway key's
+// account list knows it (#905): ID what the list keeps — an account's
+// stable id, kept through renames, a key's fingerprint — User and Plan
+// what it is shown as.
+type AccountRef struct {
+	ID   string
+	User string
+	Plan string
+	Key  bool // one of the provider's keys, not a signed-in account
+}
+
+// AccountIDs are the provider's accounts and keys as a gateway key's
+// account list knows them (#905): an account by its stable id, a key by
+// its fingerprint, with the name and plan each is shown by.
+func (p Provider) AccountIDs() []AccountRef {
+	var out []AccountRef
+	if p.Account == nil {
+		for _, k := range p.KeyList() {
+			out = append(out, AccountRef{ID: k.ID, User: cmp.Or(k.Name, k.Masked), Key: true})
+		}
+		return out
+	}
+	agent := p.Account.Agent
+	if p.IsPlugin() {
+		agent = p.ID
+	}
+	if p.Account.User != "" {
+		out = append(out, AccountRef{ID: LoginID(agent, p.Account.User), User: p.Account.User, Plan: p.Account.Plan})
+	}
+	for _, l := range Logins(agent) {
+		if !slices.ContainsFunc(out, func(r AccountRef) bool { return accountKey(r.User) == accountKey(l.User) }) {
+			out = append(out, AccountRef{ID: LoginID(agent, l.User), User: l.User, Plan: l.Plan})
+		}
+	}
+	return out
+}
+
+// AccountID is the stable id of p's account or key as a gateway key's
+// account list knows it (#905): the account's, kept through renames, or
+// a key's fingerprint.
+func (p Provider) AccountID() string {
+	if a := p.Account; a != nil && a.User != "" {
+		agent := a.Agent
+		if p.IsPlugin() {
+			agent = p.ID
+		}
+		return LoginID(agent, a.User)
+	}
+	return KeyID(p.Key)
+}
+
+// AccountNames maps every account and key a gateway key may name (#905),
+// "<provider>/<id>", to how it is shown, "<provider>/<user>"; what no
+// provider has now maps to itself.
+func AccountNames() map[string]string {
+	out := map[string]string{}
+	for _, p := range All() {
+		for _, a := range p.AccountIDs() {
+			out[p.ID+"/"+a.ID] = p.ID + "/" + a.User
 		}
 	}
 	return out
@@ -110,6 +188,21 @@ func AccountModelsOf(id, ref string) (string, []string, error) {
 		return "", nil, fmt.Errorf("%s has no account or key %q", p.Name, ref)
 	}
 	return r, p.AccountModels[accountKey(r)], nil
+}
+
+// SetModels gives the provider id the models the user picked for its
+// agents; none gives them the vendor's list again.
+func SetModels(id string, models []string) error {
+	p, err := Find(id)
+	if err != nil {
+		return err
+	}
+	ms := normalModels(models)
+	if slices.Equal(ms, normalModels(p.Models)) && !p.ServesNone() {
+		return nil
+	}
+	p.Models, p.NoModels = ms, false
+	return Save(*p)
 }
 
 // normalModels is a list of model ids as it is kept: trimmed, each once,

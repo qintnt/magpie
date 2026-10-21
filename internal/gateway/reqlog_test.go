@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -97,7 +98,7 @@ func TestAnsweredRequestKeepsItsIDAndEndpoint(t *testing.T) {
 	if got.Session != "magpie-override" || got.NativeSession != "client-session" {
 		t.Fatalf("session headers lost: %+v", got)
 	}
-	if got.RequestID != "chatcmpl-77" || got.Endpoint != "/v1/chat/completions" || got.Error != "" || got.ErrType != "" {
+	if got.ResponseID == "" || got.ResponseID != clientResponseID(t, provider.Chat, rec.Body.String(), false) || got.RequestID != "chatcmpl-77" || got.Endpoint != "/v1/chat/completions" || got.Error != "" || got.ErrType != "" {
 		t.Errorf("%+v", got)
 	}
 }
@@ -132,7 +133,7 @@ while read -r line; do
   echo '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"result":"Server is having a moment"}'
 done
 `
-	os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755)
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	s := New()
 	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
@@ -176,7 +177,7 @@ while read -r line; do
   echo '{"type":"result","subtype":"success","is_error":false,"result":""}'
 done
 `
-	os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755)
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	s := New()
 	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}

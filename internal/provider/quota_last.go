@@ -69,6 +69,10 @@ func keepLast(q SubscriptionQuota, user string) SubscriptionQuota {
 	defer c.Unlock()
 	c.load()
 	if q.Error == "" {
+		if kept := c.m[key].Q; q.readSeq != 0 && kept.readSeq > q.readSeq {
+			kept.Name, kept.Icon, kept.User = q.Name, q.Icon, q.User
+			return kept
+		}
 		if len(q.Windows) == 0 && q.Balance == "" {
 			return q
 		}
@@ -81,6 +85,7 @@ func keepLast(q SubscriptionQuota, user string) SubscriptionQuota {
 		}
 		e.Q.Error = ""
 		e.Q.AsOf = nil
+		e.Q.ReadDeferred = false
 		if c.m == nil {
 			c.m = map[string]lastQuota{}
 		}
@@ -106,11 +111,26 @@ func keepLast(q SubscriptionQuota, user string) SubscriptionQuota {
 	if !ok {
 		return q
 	}
+	out.ReadDeferred = readDeferred(q.Error)
 	out.Name, out.Icon, out.User = q.Name, q.Icon, q.User
 	if out.Name == "" {
 		out.Name, out.Icon = c.m[key].Q.Name, c.m[key].Q.Icon
 	}
 	return out
+}
+
+// readDeferred is whether err says no read was made this time (allowances
+// read only when asked, a Claude account's /usage not run) rather than a
+// read that failed. A read held back by holdUnasked fails inside the
+// vendor's HTTP call, so its error carries errNotAsked wrapped: "Get
+// \"https://…\": not read yet: …".
+func readDeferred(err string) bool {
+	for _, e := range []error{errNotAsked, errClaudeNotAsked, errClaudeSaved} {
+		if strings.Contains(err, e.Error()) {
+			return true
+		}
+	}
+	return false
 }
 
 // load reads the last readings from disk, the first time. Called with c
@@ -129,7 +149,16 @@ func (c *lastQuotasT) load() {
 func (c *lastQuotasT) reading(key string) (SubscriptionQuota, bool) {
 	out, ok := c.reported(key)
 	if ok {
-		out.Windows = elapsed(out.Windows, time.Now())
+		now := time.Now()
+		// as read, before any window started again (none had by the zero
+		// time)
+		wasUp := usedUp(out, time.Time{})
+		out.Windows = elapsed(out.Windows, now)
+		// a hold that came with a window used up ends when that window
+		// starts again; one with no window used up stands till a fresh read
+		if out.Held && wasUp && !usedUp(out, now) {
+			out.Held = false
+		}
 	}
 	return out, ok
 }
@@ -161,7 +190,7 @@ func (c *lastQuotasT) reported(key string) (SubscriptionQuota, bool) {
 // reading came back and put another first, taking conversations off the
 // account that had them cached (vincentzhang on Discord).
 func lastAllowances(agent string) map[string]Allowance {
-	logins, _, ok := usageLogins(agent)
+	logins, ok := usageLogins(agent)
 	if !ok {
 		return nil
 	}
@@ -174,7 +203,7 @@ func lastAllowances(agent string) map[string]Allowance {
 	for _, l := range logins {
 		q, ok := c.reading(loginProvider(l) + "/" + strings.ToLower(l.User))
 		if ok && len(q.Windows) > 0 {
-			out[l.User] = allowanceOf(q.Windows, now)
+			out[l.User] = allowanceOf(q.Windows, now).restartedBy(resetRunsOut(agent, l.User, q.Windows, q.Resets))
 		}
 	}
 	return out

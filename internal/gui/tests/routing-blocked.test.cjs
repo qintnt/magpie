@@ -55,7 +55,7 @@ function serve(lang) {
 
 const want = {
   en: { said: "It said: " + vendor, hint },
-  zh: { said: "原话：" + vendor, hint: "供应商的网络防火墙拦截了来自这个 IP 的请求；请稍等一会儿，或换个网络或代理" },
+  zh: { said: "原话：" + vendor, hint: "供应商的网络防火墙拦截了此 IP 的请求；请稍后再试，或更换网络或代理" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -76,12 +76,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       await page.goto("http://magpie.test/?view=routing");
-      await page.locator(".rt-day").nth(1).click();
+      await page.locator(".rt-days .rt-day").nth(1).click();
       await page.locator(".rt-req").nth(errs.length - 1).waitFor();
 
       const steps = async () => page.locator(".rt-steps li").evaluateAll((ls) => ls.map((l) => [l.className, l.textContent]));
       const row = page.locator(".rt-req").nth(0);
-      const was = await row.evaluate((e) => e.getBoundingClientRect().top);
+      // measure once the page holds still: the day's rows arriving grow the
+      // page above the list, and the day button's click is kept in place by
+      // scrolling the view, which can land after the last row is in
+      const was = await row.evaluate(async (e) => {
+        let last = NaN;
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => requestAnimationFrame(r));
+          const top = e.getBoundingClientRect().top;
+          if (top === last) return top;
+          last = top;
+        }
+        return last;
+      });
       await row.click();
       await page.waitForTimeout(400);
       assert(Math.abs((await row.evaluate((e) => e.getBoundingClientRect().top)) - was) <= 1, "picking the request moved the page");

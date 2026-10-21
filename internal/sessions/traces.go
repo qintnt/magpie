@@ -8,7 +8,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +34,14 @@ type traceTurn struct {
 	start, last          time.Time
 	input, output, model string
 	failed, completed    bool
+	finishAfter          time.Time
+	codex                codexTranscript
 }
+
+// Allow a timing extension to append its final event across reader polls.
+// Plain Pi still finishes on the next regular (two-second) poll.
+const piTimingGrace = time.Second
+
 type traceCursor struct {
 	info                     os.FileInfo
 	offset                   int64
@@ -45,6 +54,7 @@ type traceCursor struct {
 	tools                    map[string]TraceSpan
 	parents                  map[string]string
 	claudeMessage            *claudeTraceMessage
+	codexBase                string // Codex base instructions, kept only with bodies
 }
 
 // TraceReader follows supported local agent stores modified since activation.
@@ -161,6 +171,7 @@ func (r *TraceReader) Poll(bodies bool) []TraceSpan {
 	var result []TraceSpan
 	budget := int64(8 << 20)
 	seen := map[string]bool{}
+	var long []byte // nextTraceLine's buffer for a line longer than its reader's
 	for _, f := range files {
 		seen[f.path] = true
 		// Filesystem timestamps can be coarse or lag the write (Linux VFS).
@@ -175,6 +186,11 @@ func (r *TraceReader) Poll(bodies bool) []TraceSpan {
 			r.files[f.path] = c
 		}
 		if c.size == f.size && c.mod.Equal(f.mod) {
+			for _, s := range c.finishPi(time.Now()) {
+				if !s.End.Before(r.Since) {
+					result = append(result, s)
+				}
+			}
 			if f.mod.Before(time.Now().Add(-2 * time.Second)) {
 				if f.agent == "gemini" {
 					snap := r.snapshot(f.path)
@@ -213,11 +229,12 @@ func (r *TraceReader) Poll(bodies bool) []TraceSpan {
 			h.Close()
 			continue
 		}
-		b := bufio.NewReader(h)
+		b, release := lineReader(h, scanBuffer(h, c.offset))
 		// A large file is processed in bounded slices so one session cannot monopolize polling.
 		read := int64(0)
 		for read < budget {
-			line, err := b.ReadBytes('\n')
+			var line []byte
+			line, long, err = nextTraceLine(b, h, c.offset, long)
 			if err != nil {
 				break
 			}
@@ -230,9 +247,17 @@ func (r *TraceReader) Poll(bodies bool) []TraceSpan {
 				}
 			}
 		}
+		release()
 		h.Close()
 		budget -= read
 		if c.offset == f.size {
+			// Prefer timing-final, allowing a bounded wait across polls when
+			// the extension has not appended it yet.
+			for _, s := range c.finishPi(time.Now()) {
+				if !s.End.Before(r.Since) {
+					result = append(result, s)
+				}
+			}
 			c.size, c.mod = f.size, f.mod
 		}
 	}
@@ -249,6 +274,44 @@ func (r *TraceReader) Poll(bodies bool) []TraceSpan {
 	}
 	return result
 }
+
+// nextTraceLine is the next line of f, at off, read through b: the line with
+// its newline, as b.ReadBytes would give it, or an error when it has no
+// end yet (read again once it has). A line b's buffer holds is handed over
+// in it, good until the next read of b. A longer one (a pasted image in a
+// Codex rollout) is gathered into long, made once at the line's own length
+// read ahead in f, and long is given back to be used for the next one.
+// Through ReadBytes every line was a copy of its own, and a long one cost
+// about twice its size, gathered in 4 KiB pieces and then copied whole.
+func nextTraceLine(b *bufio.Reader, f *os.File, off int64, long []byte) (line, kept []byte, err error) {
+	long = long[:0]
+	for {
+		chunk, err := b.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			if len(long) == 0 {
+				l := lineLen(f, off, math.MaxInt)
+				if l == 0 {
+					return nil, long, io.ErrUnexpectedEOF // no end yet
+				}
+				if l > cap(long) {
+					long = make([]byte, 0, l)
+				}
+			}
+			// a file rewritten since the read ahead only grows long again
+			long = append(long, chunk...)
+			continue
+		}
+		if err != nil {
+			return nil, long, err
+		}
+		if len(long) == 0 {
+			return chunk, long, nil
+		}
+		long = append(long, chunk...)
+		return long, long, nil
+	}
+}
+
 func newTraceCursor(f file) *traceCursor {
 	c := &traceCursor{agent: f.agent, turns: map[string]*traceTurn{}, tools: map[string]TraceSpan{}, parents: map[string]string{}}
 	if f.agent == "claude" || f.agent == "claude-desktop" {
@@ -293,7 +356,16 @@ func (c *traceCursor) interruptCodexTurn(next string, at time.Time) []TraceSpan 
 		}
 	}
 	delete(c.turns, t.id)
+	c.endCodexTurn(t.id)
 	return spans
+}
+
+// A finished turn stops being current, so a later event without a turn ID
+// can't open it again and export it a second time as interrupted.
+func (c *traceCursor) endCodexTurn(id string) {
+	if c.current == id {
+		c.current = ""
+	}
 }
 
 func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
@@ -306,9 +378,14 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 		return nil
 	}
 	var p struct {
-		Type, ID, Model          string
-		Name                     string
-		CallID                   string `json:"call_id"`
+		Type, ID, Model, Role string
+		Name                  string
+		Content               json.RawMessage
+		Metadata              struct {
+			TurnID string `json:"turn_id"`
+		} `json:"internal_chat_message_metadata_passthrough"`
+		BaseInstructions         json.RawMessage `json:"base_instructions"`
+		CallID                   string          `json:"call_id"`
 		Input, Arguments, Output json.RawMessage
 		TurnID                   string          `json:"turn_id"`
 		ResponseID               string          `json:"response_id"`
@@ -328,11 +405,16 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 		}
 		Item struct {
 			Type, ID, Tool, Server, Status string
+			Kind, Path, SavedPath          string
 			Command                        json.RawMessage
 			Arguments                      json.RawMessage
 			Content                        json.RawMessage
 			Output                         json.RawMessage
 			Result                         json.RawMessage
+			Changes, Query, Action         json.RawMessage
+			Results, Failure               json.RawMessage
+			RevisedPrompt                  string `json:"revisedPrompt"`
+			Stdout, Stderr                 string
 			AggregatedOutput               string `json:"aggregated_output"`
 			ExitCode                       *int   `json:"exit_code"`
 		}
@@ -346,6 +428,14 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 	if o.Type == "session_meta" {
 		c.session = p.ID
 		c.provider = p.ModelProvider
+		c.codexBase = ""
+		if bodies {
+			var base struct{ Text string }
+			if json.Unmarshal(p.BaseInstructions, &base) != nil {
+				json.Unmarshal(p.BaseInstructions, &base.Text)
+			}
+			c.codexBase = base.Text
+		}
 		return nil
 	}
 	if o.Type == "turn_context" {
@@ -360,6 +450,9 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 	}
 	id := p.TurnID
 	if id == "" {
+		id = p.Metadata.TurnID
+	}
+	if id == "" {
 		id = c.current
 	}
 	if id == "" {
@@ -369,6 +462,10 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 	switch {
 	case o.Type == "response_item":
 		switch p.Type {
+		case "message":
+			if bodies && (p.Role == "user" || p.Role == "developer" || p.Role == "system" || p.Role == "assistant") {
+				t.codex.message(p.Role, p.Content)
+			}
 		case "custom_tool_call", "function_call":
 			if p.CallID == "" || len(c.tools) >= 256 {
 				return nil
@@ -380,9 +477,17 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 				if s.Input == "" {
 					s.Input = string(p.Input)
 				}
+				arguments := p.Arguments
+				if len(arguments) == 0 {
+					arguments = p.Input
+				}
+				t.codex.call(p.CallID, p.Name, arguments)
 			}
 			c.tools[p.CallID] = s
 		case "custom_tool_call_output", "function_call_output":
+			if bodies && p.CallID != "" {
+				t.codex.result(p.CallID, p.Output)
+			}
 			s, ok := c.tools[p.CallID]
 			if !ok {
 				return nil
@@ -426,15 +531,17 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 				t.output = string(p.Item.Content)
 			}
 			return nil
-		case "CommandExecution", "McpToolCall", "FileChange", "ImageView", "ContextCompaction":
+		case "CommandExecution", "McpToolCall", "FileChange", "ImageView", "ContextCompaction", "Extension":
 			// A recorded MCP completion is authoritative over the matching
 			// inferred function_call/output pair, which uses the same call ID.
 			if p.Item.Type == "McpToolCall" {
 				delete(c.tools, p.Item.ID)
 			}
-			name := map[string]string{"CommandExecution": "command", "McpToolCall": "mcp tool", "FileChange": "file change", "ImageView": "view image", "ContextCompaction": "compaction"}[p.Item.Type]
+			name := map[string]string{"CommandExecution": "command", "McpToolCall": "mcp tool", "FileChange": "file change", "ImageView": "view image", "ContextCompaction": "compaction", "Extension": "extension"}[p.Item.Type]
 			if p.Item.Tool != "" {
 				name = p.Item.Tool
+			} else if p.Item.Kind != "" {
+				name = p.Item.Kind
 			}
 			s := c.span(id, p.Item.ID, name, "tool", start, end)
 			s.Error = p.Item.Status == "failed" || p.Item.Status == "error" || p.Item.ExitCode != nil && *p.Item.ExitCode != 0
@@ -447,9 +554,10 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 				if s.Output == "" {
 					s.Output = string(p.Item.Output)
 				}
-				if s.Output == "" {
+				if s.Output == "" && p.Item.Type != "Extension" {
 					s.Output = string(p.Item.Result)
 				}
+				codexNativeBodies(&s, p.Item.Type, p.Item.Path, p.Item.Changes, p.Item.Stdout, p.Item.Stderr, p.Item.Query, p.Item.Action, p.Item.RevisedPrompt, p.Item.Results, p.Item.SavedPath, p.Item.Failure)
 			}
 			// exec may run commands which also have recorded completion events.
 			// Keep those operations beneath the enclosing exec, rather than
@@ -488,8 +596,12 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 		s.Tokens = Tokens{Input: max(0, p.Usage.Input-p.Usage.Cached-p.Usage.CacheWrite), CacheRead: p.Usage.Cached, CacheWrite: p.Usage.CacheWrite, Output: p.Usage.Output}
 		s.Reasoning = p.Usage.Reasoning
 		if bodies {
-			s.Output = t.output
-			s.Input = t.input
+			// Only what this response produced; t.output is the turn's last
+			// reply, which a later tool-call-only response didn't write.
+			var ok bool
+			if s.Input, s.Output, ok = t.codex.response(c.codexBase); !ok {
+				s.Input = t.input
+			}
 		}
 		t.last = o.Timestamp
 		return []TraceSpan{s}
@@ -506,6 +618,7 @@ func (c *traceCursor) codex(line []byte, bodies bool) []TraceSpan {
 		}
 		s := c.root(t, end, p.Type == "turn_aborted")
 		delete(c.turns, id)
+		c.endCodexTurn(id)
 		var unfinished []TraceSpan
 		for key, call := range c.tools {
 			if call.Turn == id {
@@ -547,6 +660,9 @@ func (c *traceCursor) pi(line []byte, bodies bool) []TraceSpan {
 		}
 		if t := c.turns[id]; t != nil {
 			end := time.UnixMilli(o.Data.EndAt).UTC()
+			if o.Data.EndAt <= 0 || end.Before(t.last) || o.Data.TotalMS < 0 {
+				return nil
+			}
 			if o.Data.TotalMS > 0 {
 				t.start = end.Add(-time.Duration(o.Data.TotalMS) * time.Millisecond)
 			}
@@ -567,7 +683,7 @@ func (c *traceCursor) pi(line []byte, bodies bool) []TraceSpan {
 				if json.Unmarshal(line, &usage) == nil {
 					s := c.span(id, o.ID, "model "+usage.Model+" ("+usage.Purpose+")", "generation", o.Timestamp, o.Timestamp)
 					s.Model, s.Provider, s.Inferred = usage.Model, usage.Provider, true
-					s.Tokens = Tokens{usage.Usage.Input, usage.Usage.Output, usage.Usage.CacheRead, usage.Usage.CacheWrite}
+					s.Tokens = Tokens{Input: usage.Usage.Input, Output: usage.Usage.Output, CacheRead: usage.Usage.CacheRead, CacheWrite: usage.Usage.CacheWrite}
 					return []TraceSpan{s}
 				}
 			}
@@ -589,6 +705,9 @@ func (c *traceCursor) pi(line []byte, bodies bool) []TraceSpan {
 						delete(c.tools, key)
 					}
 				}
+			}
+			if previous.completed {
+				interrupted = append(interrupted, c.root(previous, previous.last, previous.failed))
 			}
 			delete(c.turns, c.current)
 		}
@@ -675,10 +794,24 @@ func (c *traceCursor) pi(line []byte, bodies bool) []TraceSpan {
 	spans := []TraceSpan{s}
 	if toolCalls == 0 && m.StopReason != "toolUse" {
 		t.completed = true
+		t.finishAfter = time.Now().Add(piTimingGrace)
 		if bodies {
 			t.output = string(m.Content)
 		}
-		spans = append(spans, c.root(t, o.Timestamp, s.Error))
+	}
+	return spans
+}
+
+func (c *traceCursor) finishPi(now time.Time) []TraceSpan {
+	if c.agent != "pi" && c.agent != "omp" {
+		return nil
+	}
+	var spans []TraceSpan
+	for id, t := range c.turns {
+		if t.completed && !now.Before(t.finishAfter) {
+			spans = append(spans, c.root(t, t.last, t.failed))
+			delete(c.turns, id)
+		}
 	}
 	return spans
 }

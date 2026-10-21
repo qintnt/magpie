@@ -15,6 +15,7 @@ package provider
 // and a run of the same figure is its first and last point only. A cycle
 // ends where the window starts again: its reset passed, or moved further
 // than the time between two readings (a rolling window's moves with it).
+// A fixed deadline's refill also starts a cycle, even if the reset stays.
 // Points older than quotaHistKept go, and a window keeps quotaHistMax.
 //
 // Other computers' points come in through the usage sync (davsync), merged
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/lastgood"
 )
 
 const (
@@ -56,6 +58,10 @@ type QuotaPoint struct {
 	ResetsAt *time.Time `json:"resetsAt,omitempty"`
 }
 
+// StartsCycleAfter uses the same observed reset boundaries that history
+// sampling preserves, including refills with an unchanged deadline.
+func (p QuotaPoint) StartsCycleAfter(previous QuotaPoint) bool { return newCycle(previous, p) }
+
 // QuotaLine is one window's points, oldest first.
 type QuotaLine struct {
 	Name   string       `json:"name"`
@@ -74,6 +80,14 @@ type quotaHist map[string]map[string][]QuotaPoint
 
 var quotaHistMu sync.Mutex
 
+// lastNoted is each account's newest noted reading's time, kept per history
+// file and in memory only: a batch whose readings are all older notes
+// nothing new for that file (#1358).
+var (
+	lastNoted     = map[string]time.Time{}
+	lastNotedPath string
+)
+
 func quotaHistPath() string { return filepath.Join(filepath.Dir(Path()), "quota-history.json") }
 
 func parseQuotaHist(b []byte) (quotaHist, error) {
@@ -84,7 +98,8 @@ func parseQuotaHist(b []byte) (quotaHist, error) {
 	return h, nil
 }
 
-func readQuotaHist() quotaHist {
+// readQuotaHist is the history file's read; tests count the reads.
+var readQuotaHist = func() quotaHist {
 	if b, err := os.ReadFile(quotaHistPath()); err == nil {
 		h, _ := parseQuotaHist(b)
 		return h
@@ -98,6 +113,12 @@ func writeQuotaHist(h quotaHist) {
 		return
 	}
 	path := quotaHistPath()
+	// parseQuotaHist reads a file that doesn't parse as no history: it is
+	// kept aside before it is written over, and not written over when it
+	// can't be
+	if lastgood.KeepUnparsed(path, lastgood.Into[quotaHist]) != nil {
+		return
+	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	_ = writeFileAtomic(path, b)
 }
@@ -140,15 +161,23 @@ func newCycle(a, b QuotaPoint) bool {
 		return true
 	}
 	moved := b.ResetsAt.Sub(*a.ResetsAt)
+	// A manual or vendor reset can refill a fixed window without changing
+	// its deadline. Small corrections aren't a refill; a rolling deadline
+	// moving with the reading isn't a fixed window's reset either.
+	rolling := moved > 0 && (moved-b.At.Sub(a.At)).Abs() <= quotaHistSlack
+	if !rolling && moved.Abs() <= quotaHistSlack && b.Left > a.Left+5 {
+		return true
+	}
 	return moved > b.At.Sub(a.At)+quotaHistSlack || moved < -quotaHistSlack
 }
 
-// pointOf is what w says at now, if it is something to draw.
-func pointOf(w QuotaWindow, now time.Time) (QuotaPoint, bool) {
+// pointOf is what w, read at at, says, if it is something to draw; a
+// reset told in seconds counts from now, when the windows were made.
+func pointOf(w QuotaWindow, at, now time.Time) (QuotaPoint, bool) {
 	if w.Unlimited || w.Aside || w.Family != "" || w.Name == "" || math.IsNaN(w.Used) {
 		return QuotaPoint{}, false
 	}
-	p := QuotaPoint{At: now.UTC().Truncate(time.Second), Left: math.Round(max(0, min(100, 100-w.Used))*100) / 100}
+	p := QuotaPoint{At: at.UTC().Truncate(time.Second), Left: math.Round(max(0, min(100, 100-w.Used))*100) / 100}
 	reset := w.ResetsAt
 	if reset == nil && w.ResetSecs > 0 {
 		r := now.Add(time.Duration(w.ResetSecs) * time.Second)
@@ -212,18 +241,51 @@ func (h quotaHist) prune(now time.Time) {
 
 func quotaHistKey(provider, user string) string { return provider + "|" + strings.ToLower(user) }
 
-// noteQuotaHistory keeps what each window among qs says, read at now.
+// noteQuotaHistory keeps what each window among qs says, at when it was
+// read (ReadAt), or now: a reading handed back again from a cache (a
+// Claude account's, kept until Claude Code tells it again) keeps its time
+// and so isn't taken for a new one.
 func noteQuotaHistory(qs []SubscriptionQuota, now time.Time) {
 	quotaHistMu.Lock()
 	defer quotaHistMu.Unlock()
+	path := quotaHistPath()
+	if lastNotedPath != path {
+		// another history file: the noted times say nothing about it
+		lastNoted, lastNotedPath = map[string]time.Time{}, path
+	}
+	// A batch of cached readings notes nothing new: every reading's time is
+	// no newer than what was last noted for its account, so the file need
+	// not be read and parsed for that batch again (#1358).
+	skip := true
+	for _, q := range qs {
+		if q.Error != "" || q.AsOf != nil || q.Provider == "" {
+			continue // a reading kept from before isn't a new one
+		}
+		at := now
+		if q.ReadAt != nil && !q.ReadAt.After(now) {
+			at = *q.ReadAt
+		}
+		key := quotaHistKey(q.Provider, q.User)
+		if lastNoted[key].Before(at) {
+			lastNoted[key] = at
+			skip = false
+		}
+	}
+	if skip {
+		return
+	}
 	var h quotaHist
 	changed := false
 	for _, q := range qs {
 		if q.Error != "" || q.AsOf != nil || q.Provider == "" {
 			continue // a reading kept from before isn't a new one
 		}
+		at := now
+		if q.ReadAt != nil && !q.ReadAt.After(now) {
+			at = *q.ReadAt
+		}
 		for _, w := range q.Windows {
-			p, ok := pointOf(w, now)
+			p, ok := pointOf(w, at, now)
 			if !ok {
 				continue
 			}

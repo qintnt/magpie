@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"net/url"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // Cursor's CLI (cursor-agent) keeps a chat in a folder of its own under its
@@ -44,10 +46,10 @@ import (
 // CursorDir is Cursor's CLI config folder: $CURSOR_CONFIG_DIR, else cursor
 // in $XDG_CONFIG_HOME, else ~/.cursor.
 func CursorDir() string {
-	if d := strings.TrimSpace(os.Getenv("CURSOR_CONFIG_DIR")); d != "" {
+	if d := strings.TrimSpace(appdir.Getenv("CURSOR_CONFIG_DIR")); d != "" {
 		return d
 	}
-	if d := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); d != "" {
+	if d := strings.TrimSpace(appdir.Getenv("XDG_CONFIG_HOME")); d != "" {
 		return filepath.Join(d, "cursor")
 	}
 	home, _ := os.UserHomeDir()
@@ -57,7 +59,7 @@ func CursorDir() string {
 // cursorDataDir is where Cursor keeps its projects' files, the chats'
 // transcripts among them: $CURSOR_DATA_DIR, else ~/.cursor.
 func cursorDataDir() string {
-	if d := strings.TrimSpace(os.Getenv("CURSOR_DATA_DIR")); d != "" {
+	if d := strings.TrimSpace(appdir.Getenv("CURSOR_DATA_DIR")); d != "" {
 		return d
 	}
 	home, _ := os.UserHomeDir()
@@ -177,7 +179,8 @@ func cursorParentOf(f file) string {
 // in -shm when they are; both would change the folder and make the chat
 // look written to a moment ago. A store with no log to replay is opened
 // immutable, which touches nothing; one with a log is read from a copy of
-// the two files, in a folder of magpie's own that close removes.
+// the two files, in a folder of magpie's own that close removes; a large
+// store's copy is shared while it is unchanged (cursor_snapshot.go).
 func openCursorStore(path string) (db *sql.DB, closeDB func(), err error) {
 	open := func(p, query string) (*sql.DB, error) {
 		u := url.URL{Scheme: "file", Path: filepath.ToSlash(p), RawQuery: query}
@@ -201,24 +204,14 @@ func openCursorStore(path string) (db *sql.DB, closeDB func(), err error) {
 		}
 		return db, func() { db.Close() }, nil
 	}
-	tmp, err := os.MkdirTemp("", "magpie-cursor-")
+	if stamp, size, ok := cursorStamp(path); ok && size >= cursorSnapMin {
+		return sharedCursorStore(path, stamp, open)
+	}
+	db, tmp, err := snapshotCursorStore(path, open)
 	if err != nil {
 		return nil, nil, err
 	}
-	gone := func() { os.RemoveAll(tmp) }
-	copied := filepath.Join(tmp, "store.db")
-	for _, side := range []string{"", "-wal"} {
-		if err := copyFile(path+side, copied+side); err != nil {
-			gone()
-			return nil, nil, err
-		}
-	}
-	db, err = open(copied, "_pragma=busy_timeout(3000)")
-	if err != nil {
-		gone()
-		return nil, nil, err
-	}
-	return db, func() { db.Close(); gone() }, nil
+	return db, func() { db.Close(); os.RemoveAll(tmp) }, nil
 }
 
 func copyFile(from, to string) error {
@@ -267,7 +260,7 @@ func cursorFiles() []file {
 		}
 		out = append(out, f)
 	}
-	return out
+	return append(out, cursorEditorFiles(out)...)
 }
 
 // pbFields reads a protobuf message's fields of one number that are bytes
@@ -423,6 +416,9 @@ func cursorTyped(parts []cursorPart) (typed, other string) {
 
 // parseCursor reads a chat's store whole.
 func parseCursor(f file) *state {
+	if f.readOnly {
+		return parseCursorEditor(f)
+	}
 	s := &state{Size: f.size, Mod: f.mod.UnixNano()}
 	dir := filepath.Dir(f.path)
 	last := f.mod

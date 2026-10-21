@@ -308,15 +308,14 @@ func TestRuleUnreadyMember(t *testing.T) {
 	}
 }
 
-// A rule for images lets a group with a text-only member take them, and
-// sends them where they are seen; without one, a text-only member keeps
-// images out of the group.
+// A rule for images sends them where they are seen; without one, they go
+// to a member that sees too, past a text-only one first in line (#756).
 func TestRuleImages(t *testing.T) {
 	img := `{"model":"group/r","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}]}`
 	s, _, b := ruled(t)
 	noVision(t)
-	if code, _ := postAs(t, s, "x", img); code != 400 || b.n() != 0 {
-		t.Fatalf("no rules: %d, b %d", code, b.n())
+	if code, out := postAs(t, s, "x", img); code != 200 || !strings.Contains(out, "from kb") || b.n() != 1 {
+		t.Fatalf("no rules: %d %s, b %d", code, out, b.n())
 	}
 	s, a, b := ruled(t, provider.Rule{Use: "b/big", Images: true})
 	code, out := postAs(t, s, "x", img)
@@ -330,7 +329,7 @@ func TestRuleImages(t *testing.T) {
 		t.Fatalf("a %d b %d", a.n(), b.n())
 	}
 	for _, e := range provider.Catalog() {
-		if e.ID == "group/r" && (!e.Images || e.Context != 64000) {
+		if e.ID == "group/r" && (!e.Images || e.Context != 1000000) {
 			t.Fatalf("catalog: %+v", e)
 		}
 	}
@@ -442,7 +441,7 @@ func TestRuleFirstAndOfMember(t *testing.T) {
 		pl.order = append(pl.order, Weighed{ID: c.rest, Model: c.model})
 	}
 	pl.order[3].Rest = &Rest{}
-	got, gp, lead := ruleFirst([]provider.Member{{Provider: b, Model: "m"}}, cs, pl)
+	got, gp, lead := ruleFirst([]provider.Member{{Provider: b, Model: "m"}}, cs, pl, 1, nil)
 	ok := lead == 0
 	var ids []string
 	for i, c := range got {
@@ -455,7 +454,7 @@ func TestRuleFirstAndOfMember(t *testing.T) {
 		t.Fatalf("%v %v", ok, ids)
 	}
 	// a later rule's member follows the first's, before everyone else (#112)
-	got, _, lead = ruleFirst([]provider.Member{{Provider: provider.Provider{ID: "c"}, Model: "m"}, {Provider: a, Model: "m"}, {Provider: b, Model: "m"}}, cs, pl)
+	got, _, lead = ruleFirst([]provider.Member{{Provider: provider.Provider{ID: "c"}, Model: "m"}, {Provider: a, Model: "m"}, {Provider: b, Model: "m"}}, cs, pl, 1, nil)
 	ids = nil
 	for _, c := range got {
 		ids = append(ids, c.rest+"/"+c.model)
@@ -463,7 +462,7 @@ func TestRuleFirstAndOfMember(t *testing.T) {
 	if lead != 1 || strings.Join(ids, " ") != "a/m ab/m ab@me/m ab#k2/x ab#k2/m" {
 		t.Fatalf("%d %v", lead, ids)
 	}
-	if _, _, lead := ruleFirst([]provider.Member{{Provider: provider.Provider{ID: "c"}, Model: "m"}}, cs, pl); lead >= 0 {
+	if _, _, lead := ruleFirst([]provider.Member{{Provider: provider.Provider{ID: "c"}, Model: "m"}}, cs, pl, 1, nil); lead >= 0 {
 		t.Fatal("no candidates of c")
 	}
 	// "a" is not "ab"'s
@@ -579,7 +578,7 @@ func TestRuleTurnOutgrowsNinetyFivePercentOfAnOverriddenWindow(t *testing.T) {
 	}
 }
 
-// An unlisted text-only member still keeps images out of its group.
+// An unlisted text-only member is passed over for an image as well.
 func TestRuleImagesUnlistedMember(t *testing.T) {
 	img := `{"model":"group/r","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}]}`
 	s, a, b := ruled(t)
@@ -592,7 +591,7 @@ func TestRuleImagesUnlistedMember(t *testing.T) {
 	if err := provider.Save(*p); err != nil {
 		t.Fatal(err)
 	}
-	if code, out := postAs(t, s, "x", img); code != 400 || a.n() != 0 || b.n() != 0 {
+	if code, out := postAs(t, s, "x", img); code != 200 || a.n() != 0 || b.n() != 1 {
 		t.Fatalf("%d %s, a %d b %d", code, out, a.n(), b.n())
 	}
 }

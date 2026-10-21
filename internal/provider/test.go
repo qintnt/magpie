@@ -21,6 +21,7 @@ import (
 
 // Result is what a probe of one endpoint came back with.
 type Result struct {
+	Account  string   `json:"account,omitempty"`
 	Protocol Protocol `json:"protocol"`
 	OK       bool     `json:"ok"`
 	Status   int      `json:"status,omitempty"`
@@ -37,9 +38,29 @@ func (p Provider) Test(ctx context.Context) []Result {
 	if p.DecideOnly() {
 		return p.testDecide(ctx)
 	}
-	p.Fetch(ctx)
+	_, listErr := p.Fetch(ctx)
+	if client := testClient(ctx); client != "" {
+		// the one endpoint that agent's requests go to
+		proto := clientProto(client, p.Speaks())
+		q, ok := p.keyFor(proto)
+		model := p.testModel(q, proto)
+		if why := p.TestsAs(client); why != "" {
+			return []Result{{Protocol: proto, Model: model, Error: why}}
+		}
+		if !ok {
+			return []Result{{Protocol: proto, Model: model, Error: "no key is on for this endpoint"}}
+		}
+		if model == "" && q.zenPublic() {
+			return []Result{{Protocol: proto, Error: zenPublicNone}}
+		}
+		url, body := tiny(q, proto, UpstreamName(p, model))
+		return []Result{probe(ctx, q, proto, url, q.tested(asClient(client, proto, body)), model, testWait)}
+	}
 	if p.isClaudeAccount() {
 		return []Result{p.testClaude(ctx, p.testModel(p, Anthropic))}
+	}
+	if p.testsTranslated() {
+		return []Result{p.testTranslated(ctx, p.testModel(p, CodeAssist))}
 	}
 	var out []Result
 	for _, proto := range p.Speaks() {
@@ -49,10 +70,23 @@ func (p Provider) Test(ctx context.Context) []Result {
 			out = append(out, Result{Protocol: proto, Model: model, Error: "no key is on for this endpoint"})
 			continue
 		}
+		if model == "" && q.zenPublic() {
+			// an API Zen serves no free model on: public reaches none
+			// of its models, which is no fault of the key's
+			continue
+		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
-		out = append(out, probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait))
+		out = append(out, probe(ctx, q, proto, url, q.tested(body), model, testWait))
 	}
-	if p.Decides() {
+	if len(out) == 0 && p.zenPublic() {
+		out = append(out, Result{Protocol: Chat, Error: zenPublicNone})
+	}
+	if p.IsRemoteMagpie() {
+		// The model list already checked its key and named its decisions.
+		if model := p.Jev(); listErr == nil && model != "" {
+			out = append(out, Result{Protocol: "decide", Model: model, OK: true, Status: http.StatusOK})
+		}
+	} else if p.Decides() {
 		out = append(out, p.testDecide(ctx)...)
 	}
 	return out
@@ -66,7 +100,7 @@ func tiny(q Provider, proto Protocol, model string) (url, body string) {
 		body = strings.TrimSuffix(body, "}") + `,"stream":true}`
 	}
 	if q.OpenCodeFree(model) && body != "" {
-		body = zenFreeProbe(proto, body)
+		url, body = OpenCodeFreeURL(url), zenFreeProbe(proto, body)
 	}
 	if q.IsCline() && body != "" {
 		body = clineProbe(body)
@@ -99,40 +133,73 @@ func clineProbe(body string) string {
 }
 
 // ModelTest says why p's models can't each be sent a test request ("" when
-// they can): "decide" for a decision API, whose models only classify and
-// whose endpoint Test asks it for them; "own-api" for a sign-in reached
+// they can): "decide" for a decision API whose models can't each be sent
+// a System One question (AsksDecideModels), whose endpoint Test asks it
+// for them; "own-api" for a sign-in reached
 // through its agent's own API (Cursor, Devin, Kiro, Zed, Qoder, a Google
 // sign-in), which the gateway translates every request for, so a probe
-// has no endpoint to go to.
+// has no endpoint to go to. A Google sign-in's are asked through the
+// gateway's translator (testsTranslated). Vertex AI's generateContent is
+// asked as it is.
 func (p Provider) ModelTest() string {
 	if p.DecideOnly() {
+		if p.AsksDecideModels() {
+			return ""
+		}
 		return "decide"
 	}
-	if p.isClaudeAccount() {
+	if p.isClaudeAccount() || p.testsTranslated() || p.IsVertex() {
 		return ""
 	}
 	for _, pr := range p.Speaks() {
-		if pr == Chat || pr == Responses || pr == Anthropic {
+		if pr == Chat || pr == Responses || pr == Anthropic || pr == Gemini && p.Gemini != "" {
 			return ""
 		}
 	}
 	return "own-api"
 }
 
+// AsksDecideModels reports whether each of p's decision models can be
+// sent a System One question of its own (TestModels): where the API is
+// System One's, TypeSafe's or a gateway's that serves it as it is
+// (Vercel's TypeSafe API, OpenRouter's), or Workers AI's, which DecideAsk
+// wraps it for (ARNO on Discord: cloudflare-jev's models couldn't be
+// tested from their right-click); not Vercel's evaluation models, which
+// name the model in headers of their own.
+func (p Provider) AsksDecideModels() bool {
+	v := p.DecideVia()
+	return p.Decides() && (v == ViaSystemOne || v == ViaVercel || v == ViaCloudflare)
+}
+
+// mantleBase is base for model at the prefix Mantle serves it under
+// (MantleBase), for a Mantle provider; base for any other.
+func (p Provider) mantleBase(base, model string) string {
+	if !p.IsBedrockMantle() {
+		return base
+	}
+	return MantleBase(base, model, false)
+}
+
 func tinyBody(q Provider, proto Protocol, model string) (url, body string) {
 	switch proto {
 	case Chat:
 		if q.IsBedrock() || q.IsAzure() {
-			return q.Chat + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":16}`, model)
+			return q.mantleBase(q.Chat, model) + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":16}`, model)
 		}
 		return q.Chat + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":16}`, model)
 	case Responses:
-		return q.Responses + "/responses", fmt.Sprintf(`{"model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":16}`, model)
+		return q.mantleBase(q.Responses, model) + "/responses", fmt.Sprintf(`{"model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":16}`, model)
 	case Anthropic:
 		return q.Anthropic + "/v1/messages", fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, model)
 	case Gemini:
-		// Factory's generate route. droid sends no stream field.
-		return q.Base(Gemini) + "/generate", fmt.Sprintf(`{"model":%q,"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, model)
+		if q.IsVertex() {
+			return vertexTest(q, model)
+		}
+		if q.FactoryGemini() {
+			// Factory's generate route. droid sends no stream field.
+			return q.Base(Gemini) + "/generate", fmt.Sprintf(`{"model":%q,"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, model)
+		}
+		return q.Gemini + GeminiPath(model, false), `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}}`
 	}
 	return "", ""
 }
@@ -146,9 +213,10 @@ const (
 
 // drawsOnImages is whether model is asked on p's images API, as the
 // gateway draws with it there: chat would be turned away, or answered in
-// no shape a chat test knows. OpenRouter draws everything in chat.
+// no shape a chat test knows. OpenRouter's image-only models use its /images
+// endpoint; its chat image models still use chat completions.
 func (p Provider) drawsOnImages(model string) bool {
-	return p.Account == nil && p.Chat != "" && HostOf(p.Chat) != "openrouter.ai" && catalog.ImagesAPI(model)
+	return p.Account == nil && p.Chat != "" && catalog.ImagesAPI(model)
 }
 
 // tinyDrawing is the smallest images request for model: one picture of
@@ -160,7 +228,11 @@ func tinyDrawing(q Provider, model string) (url, body string) {
 		req["quality"] = "low"
 	}
 	b, _ := json.Marshal(req)
-	return strings.TrimRight(q.Chat, "/") + "/images/generations", string(b)
+	path := "/images/generations"
+	if HostOf(q.Chat) == "openrouter.ai" {
+		path = "/images"
+	}
+	return strings.TrimRight(q.Chat, "/") + path, string(b)
 }
 
 // TestModels sends each of models the smallest request, a few at a time,
@@ -185,8 +257,34 @@ func (p Provider) TestModels(ctx context.Context, models []string) []Result {
 }
 
 func (p Provider) testOne(ctx context.Context, model string) Result {
+	if pat, off := ModelDisabled(p.ID, model); off {
+		// the user disabled it (#1867): not even a test reaches it
+		return Result{Model: model, Error: fmt.Sprintf("model %s/%s is disabled in magpie (it matches %q in Settings › Models › Disabled models)", p.ID, model, pat)}
+	}
+	if p.DecidesModel(model) && p.AsksDecideModels() {
+		// a decision model is sent the smallest System One question, a
+		// yes-or-no (ARNO on Discord: a System One model typed in by hand
+		// couldn't be tested from its right-click)
+		t0 := time.Now()
+		r := Result{Protocol: "decide", Model: model}
+		err := p.AskSystemOne(ctx, model)
+		r.Millis = time.Since(t0).Milliseconds()
+		if err != nil {
+			r.Error = err.Error()
+			return r
+		}
+		r.OK, r.Status = true, http.StatusOK
+		return r
+	}
+	client := testClient(ctx)
+	if why := p.TestsAs(client); why != "" {
+		return Result{Protocol: clientProto(client, p.Speaks()), Model: model, Error: why}
+	}
 	if p.isClaudeAccount() {
 		return p.testClaude(ctx, model)
+	}
+	if p.testsTranslated() {
+		return p.testTranslated(ctx, model)
 	}
 	var protos []Protocol
 	for _, pr := range p.Speaks() {
@@ -201,8 +299,11 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 	// Claude model, else the one it prefers; an image model draws on the
 	// chat endpoint's images API
 	proto := protos[0]
-	draws := p.drawsOnImages(model) && slices.Contains(protos, Chat)
-	if draws {
+	draws := client == "" && p.drawsOnImages(model) && slices.Contains(protos, Chat)
+	if client != "" {
+		// on the API that agent's requests go to (TestAs)
+		proto = clientProto(client, protos)
+	} else if draws {
 		proto = Chat
 	} else if apis := p.APIs(model); apis != nil {
 		if i := slices.IndexFunc(protos, func(pr Protocol) bool { return slices.Contains(apis, pr) }); i >= 0 {
@@ -215,10 +316,11 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 	q, ok := p, true
 	if keys := p.KeysOn(); len(keys) > 0 {
 		ok = false
+		serves := p.Serving(model)
 	pick:
 		for _, want := range []Protocol{proto, ""} {
 			for _, k := range keys {
-				if k.Protocol == want && p.Serves(k, model) {
+				if k.Protocol == want && serves(k) {
 					q, ok = p.WithKey(k), true
 					break pick
 				}
@@ -238,16 +340,30 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 		// by is not one magpie sends them as
 		url, body := tinyDrawing(q, model)
 		r := probe(ctx, q, proto, url, []byte(body), model, drawWait)
-		if !r.OK && (r.Status == 404 || r.Status == 405) {
+		if !r.OK && ((r.Status == 404 || r.Status == 405) && HostOf(q.Chat) != "openrouter.ai" || r.Status == 400 && catalog.PointsToChat(r.Error)) {
 			url, body := tiny(q, proto, model)
-			if c := probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait); c.OK {
+			if c := probe(ctx, q, proto, url, q.tested(body), model, testWait); c.OK {
 				return c
 			}
 		}
 		return r
 	}
 	url, body := tiny(q, proto, UpstreamName(p, model))
-	return probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait)
+	if client != "" {
+		body = asClient(client, proto, body)
+	}
+	r := probe(ctx, q, proto, url, q.tested(body), model, testWait)
+	if !r.OK && client == "" && proto == Chat && r.Status == 400 && catalog.DrawsID(model) && catalog.PointsToImagesAPI(r.Error) {
+		// an image model its name doesn't place on the images API
+		// (agnes-image-2.5-flash, #1837), which the vendor turns away in
+		// chat naming that API: the gateway draws with it there, so it is
+		// tested there
+		url, body := tinyDrawing(q, model)
+		if d := probe(ctx, q, proto, url, []byte(body), model, drawWait); d.OK {
+			return d
+		}
+	}
+	return r
 }
 
 // keyFor is p using the first key on that works with proto: one made for
@@ -267,12 +383,28 @@ func (p Provider) keyFor(proto Protocol) (Provider, bool) {
 	return p, false
 }
 
+// zenPublic is whether p is OpenCode Zen asked with the key OpenCode
+// sends signed out (public), which Zen's free models alone answer.
+func (p Provider) zenPublic() bool {
+	return p.IsOpenCode() && p.Key == OpenCodeAnonymousKey
+}
+
+// zenPublicNone is why Zen's public key has nothing to test.
+const zenPublicNone = "no free model of OpenCode Zen is listed for this API: the public key reaches only the free ones (refresh the model list, or add a Zen key for the rest)"
+
 // testModel is the model a probe of proto's endpoint asks for: the first
 // exposed one q's key sees, else the first it sees at all — preferring a
 // Claude model on the Anthropic endpoint, and one that chats to one that
-// draws on an images API.
+// draws on an images API. On OpenCode's gateway a model models.dev names
+// no API for is served on chat alone, so no other endpoint is tried with
+// it; and with Zen's public key only a free model is tried, on an API it
+// is served on, or none (z'x on Discord: Test asked public for
+// claude-fable-5 on Messages, gemini-3-flash on Gemini and big-pickle on
+// Responses, and every one failed, though big-pickle answers on chat).
 func (p Provider) testModel(q Provider, proto Protocol) string {
 	k := q.first()
+	public := q.zenPublic()
+	off := disabledNow() // a model the user disabled is never asked (#1867)
 	var pools [][]catalog.Model
 	if ms := p.Exposed(); len(ms) > 0 {
 		pools = append(pools, ms)
@@ -286,13 +418,20 @@ func (p Provider) testModel(q Provider, proto Protocol) string {
 			if apis := p.APIs(id); apis != nil {
 				return slices.Contains(apis, proto)
 			}
-			return proto != Anthropic || isClaude(id)
+			if p.IsOpenCode() {
+				// each model on one API, chat for the rest (openCodeEndpoints)
+				return proto == Chat || proto == Anthropic && isClaude(id)
+			}
+			return (proto != Anthropic || isClaude(id)) && !p.NamedOnlyOn(proto)
 		},
-		func(string) bool { return true },
+		func(string) bool { return !public },
 	} {
 		for _, pool := range pools {
 			for _, m := range pool {
-				if !p.DecidesModel(m.ID) && want(m.ID) && (k.Key == "" || p.Serves(k, m.ID)) {
+				if public && !p.OpenCodeFree(m.ID) {
+					continue
+				}
+				if !p.DecidesModel(m.ID) && !off(p.ID, m.ID) && want(m.ID) && (k.Key == "" || p.Serves(k, m.ID)) {
 					return m.ID
 				}
 			}
@@ -315,7 +454,8 @@ func isClaude(id string) bool {
 // Azure OpenAI takes a key in api-key alone: a Bearer there is an Entra ID
 // token, and the key sent as one is turned away.
 func AuthHeaders(p Provider, proto Protocol) map[string]string {
-	if p.Key == "" {
+	// Vertex AI's is the Google token Sign sets, which a key would replace
+	if p.Key == "" || p.IsVertex() {
 		return map[string]string{}
 	}
 	if p.IsAzure() {
@@ -324,9 +464,22 @@ func AuthHeaders(p Provider, proto Protocol) map[string]string {
 		}
 		return map[string]string{"api-key": p.Key}
 	}
+	if proto == Gemini && !p.FactoryGemini() {
+		// Google's Gemini API takes an API key here, and turns one away as
+		// a Bearer token ("Expected OAuth 2 access token"); relays that
+		// answer as it does read it here too
+		return map[string]string{"x-goog-api-key": p.Key}
+	}
 	if proto == Anthropic {
 		if strings.HasSuffix(p.Host(), "anthropic.com") || p.IsBedrock() {
 			return map[string]string{"x-api-key": p.Key}
+		}
+		// a vendor that takes one alone (AuthHeader, RetryOneAuth)
+		switch p.AuthHeader {
+		case AuthXAPIKey:
+			return map[string]string{"x-api-key": p.Key}
+		case AuthBearer:
+			return map[string]string{"Authorization": "Bearer " + p.Key}
 		}
 		return map[string]string{"x-api-key": p.Key, "Authorization": "Bearer " + p.Key}
 	}
@@ -347,9 +500,11 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 		return r
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("anthropic-version", "2023-06-01")
-	if p.IsOpenCode() {
-		OpenCodeClient(req.Header, "")
+	if proto == Anthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	if OpenCodeURL(url) {
+		OpenCodeClient(req.Header, "") // a session of the probe's own
 	}
 	if p.IsCline() {
 		ClineClient(req.Header)
@@ -357,12 +512,28 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 	if p.IsKilo() {
 		KiloClient(req.Header, p.Key, "")
 	}
+	if client := testClient(ctx); client != "" {
+		clientHeaders(client, req.Header)
+	}
 	if err := p.Sign(ctx, req, proto, body); err != nil {
 		r.Error = err.Error()
 		return r
 	}
 	start := time.Now()
 	res, err := p.Do(http.DefaultClient, req)
+	if err == nil && proto == Anthropic {
+		// a vendor that takes one of the two key headers alone
+		res, err = RetryOneAuth(p, req, res, func(r *http.Request) (*http.Response, error) { return p.Do(http.DefaultClient, r) })
+	}
+	if err == nil && proto == Chat {
+		// a GLM Coding Plan's key at Zhipu's pay-as-you-go endpoint
+		res, err = RetryZhipuCoding(p, req, res, func(r *http.Request) (*http.Response, error) { return p.Do(http.DefaultClient, r) })
+	}
+	if err == nil {
+		// Zhipu's Responses API refuses a key 200, in an envelope: the
+		// refusal it is, not a green check (@xanahopper on X)
+		res = ZhipuEnveloped(req, res)
+	}
 	r.Millis = time.Since(start).Milliseconds()
 	if err != nil {
 		r.Error = strings.TrimPrefix(err.Error(), "Post \""+url+"\": ")
@@ -461,7 +632,7 @@ var edgeBlocked = regexp.MustCompile(`(?i)request has been blocked|errors\.aliyu
 // EdgeBlocked says whether an error body is a firewall's block page rather
 // than the vendor's API answering, or one already put in plain words.
 func EdgeBlocked(b []byte) bool {
-	return edgeBlocked.Match(b) || bytes.Contains(b, []byte(BlockedHint)) || bytes.Contains(b, []byte(ZCodeStartBlockedHint))
+	return edgeBlocked.Match(b) || bytes.Contains(b, []byte(BlockedHint))
 }
 
 // APIError pulls the human message out of an error body when there is one.
@@ -478,8 +649,21 @@ func APIError(b []byte, fallback string) string {
 	if link, ok := Verification(b); ok {
 		return VerifyMessage(apiError(b, fallback), link)
 	}
+	if cmdGoNoAPI.Match(b) {
+		return apiError(b, fallback) + " — " + CommandCodeGoHint
+	}
 	return apiError(b, fallback)
 }
+
+// cmdGoNoAPI is Command Code's Provider API refusing a Go plan's key:
+// "Your Go plan doesn't include API access. Upgrade to Provider or higher
+// …" (#969). Go's key is only taken where Command Code's CLI asks, which
+// the Command Code plugin does; an API-key provider (the "commandcode"
+// preset) never can.
+var cmdGoNoAPI = regexp.MustCompile(`(?i)\bGo plan doesn.t include API access`)
+
+// CommandCodeGoHint says where a Go plan's key works.
+const CommandCodeGoHint = "a Go plan's key works in magpie through the Command Code plugin (Plugins › Command Code, then sign in with the key), which asks Command Code as its CLI does; a Command Code API-key provider can't use it"
 
 // verifyWords is a refusal asking for the account to be verified, put in
 // words rather than as VALIDATION_REQUIRED — or already by VerifyMessage.

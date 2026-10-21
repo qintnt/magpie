@@ -13,6 +13,13 @@ const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
+// the editor folds what few need under Advanced, this field among them:
+// opened as a reader would, unless something set in it opened it already
+const unfold = async (page) => {
+  const adv = page.locator(".editor details.advanced");
+  await adv.waitFor({ state: "attached" });
+  if (!(await adv.evaluate((d) => d.open))) await adv.locator(":scope > summary").click();
+};
 const relay = {
   id: "relay", name: "Relay", icon: "generic", chat: "", responses: "", anthropic: "https://relay.example.com", catalog: "",
   models: [{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5", on: true }], agents: [], fallback: [], headers: {},
@@ -74,6 +81,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=providers");
       await page.locator(".row.provider", { hasText: name }).click();
+      await unfold(page);
       await page.locator(".editor .bar").waitFor();
       return { page, errors, posts };
     };
@@ -96,7 +104,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(saved.body.searches, true);
       const missing = await page.evaluate(() => [
         "Web search", "Searches the web by itself",
-        "For a relay in front of Anthropic's or OpenAI's own API: Claude Code's WebSearch and Codex's web_search go to it as they were sent, not through magpie's search. magpie doesn't search with it for other models.",
+        "For a relay in front of Anthropic's or OpenAI's own API: Claude Code's WebSearch and Codex's web_search go to it as they were sent, not through magpie's search. magpie doesn't automatically search with it for other models, but you can name it as the searcher.",
       ].filter((k) => !I18N.zh[k]));
       assert.deepEqual(missing, [], "every string has its Chinese");
       assert.deepEqual(errors, []);

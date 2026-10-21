@@ -11,6 +11,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const HOME = "/Users/aimer";
@@ -20,7 +21,7 @@ const words = {
     refused: "a GitHub token is one word, without spaces", limited: "GitHub allows 60 requests an hour without a token, used up until {time}. Add a GitHub token in Settings → Network and sharing to raise it to 5,000.",
     withToken: "GitHub's rate limit for your GitHub token is used up until {time}", check: "Check for updates" },
   zh: { head: "GitHub", name: "GitHub 令牌", save: "保存", remove: "移除", env: "正在使用环境变量 GH_TOKEN",
-    refused: "GitHub 令牌是一串不含空格的字符", limited: "GitHub 对不带令牌的请求每小时只允许 60 次，已用完，{time} 恢复。在 设置 → 网络与共享 中添加 GitHub 令牌，可提高到每小时 5000 次。",
+    refused: "GitHub 令牌是一串不含空格的字符", limited: "GitHub 不带令牌每小时仅允许 60 次请求，已用完，{time} 恢复。在 设置 → 网络与共享 添加 GitHub 令牌可提高到 5000 次。",
     withToken: "你的 GitHub 令牌的请求额度已用完，{time} 恢复", check: "检查更新" },
 };
 const UNTIL = "2030-01-02T03:04:00Z";
@@ -77,7 +78,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       page.on("pageerror", (e) => errors.push(e.message));
       const posted = [], st = { mask: "", from: "", env: false };
       await page.route("**/*", serve(lang, posted, st));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings&tab=network");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       const list = page.locator("#githubList");
       const row = list.locator(".row.github-token");
       await row.waitFor();
@@ -131,12 +134,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (const st of [{ mask: "", from: "" }, { mask: "ghp_…0123", from: "settings" }]) {
         await page.unroute("**/*");
         await page.route("**/*", serve(lang, [], st));
+        await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=library");
+        await settingsDrawn(page); // rows found are the ones that stay (#1659)
         const check = page.locator("#view-library button.lib-updall", { hasText: w.check });
         await check.waitFor();
         await check.click();
         await page.waitForFunction(() => document.querySelector("#view-library .lib-unchecked"));
-        const time = await page.evaluate((u) => new Date(u).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), UNTIL);
+        const time = await page.evaluate((u) => new Date(u).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }), UNTIL);
         const want = (st.from ? w.withToken : w.limited).replace("{time}", time);
         assert((await page.locator("#status").textContent()).includes(want), `status: ${await page.locator("#status").textContent()}`);
         assert.equal(await page.locator("#view-library .lib-unchecked").getAttribute("title"), want);

@@ -16,9 +16,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filelock"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -30,6 +32,82 @@ func Managed(secret string) bool {
 	return strings.HasPrefix(secret, legacyLANPrefix)
 }
 
+// Named: secret has a named gateway key's form (sk-magpie-…), or is the
+// key's own value a user gave it (Change.Secret), so a request from this
+// computer with one is counted and limited as that key, as a sk-magpie-
+// key is.
+func Named(secret string) bool {
+	if Managed(secret) {
+		return true
+	}
+	if secret == "" {
+		return false
+	}
+	own := ownSecrets()
+	_, ok := own[secret]
+	return ok
+}
+
+// own caches the key store's own-value secrets by the file's size and
+// time, so a request from this computer doesn't read it each time.
+var own struct {
+	sync.Mutex
+	size    int64
+	mod     int64
+	secrets map[string]struct{}
+}
+
+func ownSecrets() map[string]struct{} {
+	fi, err := os.Stat(Path())
+	if err != nil {
+		return nil
+	}
+	own.Lock()
+	defer own.Unlock()
+	if own.secrets != nil && own.size == fi.Size() && own.mod == fi.ModTime().UnixNano() {
+		return own.secrets
+	}
+	mu.Lock()
+	keys, err := load()
+	mu.Unlock()
+	if err != nil {
+		return nil // unknown: tried again on the next request
+	}
+	m := map[string]struct{}{}
+	for _, k := range keys {
+		if k.Secret != "" && !Managed(k.Secret) {
+			m[k.Secret] = struct{}{}
+		}
+	}
+	own.size, own.mod, own.secrets = fi.Size(), fi.ModTime().UnixNano(), m
+	return m
+}
+
+// ownSecret checks a key value a user brings (one their clients already
+// send, from another gateway they move from, such as CLIProxyAPI's
+// api-keys, which are any string): what an HTTP header carries, and no
+// other key's.
+func ownSecret(secret string, keys []Key) (string, error) {
+	secret = strings.TrimSpace(secret)
+	if n := len(secret); n < 8 || n > 256 {
+		return "", errors.New("Use a key between 8 and 256 characters")
+	}
+	for i := 0; i < len(secret); i++ {
+		if c := secret[i]; c <= ' ' || c > '~' {
+			return "", errors.New("A key can have only letters, digits and ASCII symbols, no spaces")
+		}
+	}
+	if strings.HasPrefix(secret, legacyLANPrefix) {
+		return "", errors.New("A key of your own can't start with sk-magpie-: leave the key empty and magpie makes one")
+	}
+	for _, k := range keys {
+		if subtle.ConstantTimeCompare([]byte(secret), []byte(k.Secret)) == 1 {
+			return "", errors.New("Another gateway key already has this key")
+		}
+	}
+	return secret, nil
+}
+
 type Key struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
@@ -39,12 +117,33 @@ type Key struct {
 	Masked string `json:"masked,omitempty"`
 	// Limit is the key's own budget (#585); nil for none.
 	Limit *Limit `json:"limit,omitempty"`
+	// More are its limits after the first (#2227), each a window of its
+	// own: a request passes only while every one has something left. A
+	// key has them only beside a Limit, which an older magpie still reads.
+	More []Limit `json:"moreLimits,omitempty"`
+	// Models are the models the key may use (#882): "<provider>/<model>",
+	// "<provider>/*" or a group's "group/<name>"; none for every model.
+	Models []string `json:"models,omitempty"`
+	// Accounts are the accounts and keys the key may use (#905), as
+	// "<provider>/<account>": a signed-in account by its stable id, a
+	// key by its fingerprint; none for every account, as keys always did.
+	Accounts []string `json:"accounts,omitempty"`
+	// Quotas lets a key held to a budget, models or accounts be told the
+	// quotas of what it may use (#2216): the cards of the providers whose
+	// every model it may use, of the accounts and keys it may use, names
+	// and balances included. Off, it is told none (#1981).
+	Quotas bool `json:"quotas,omitempty"`
 }
 
-// Identity is the gateway key a request came with, and its budget.
+// Identity is the gateway key a request came with, its budget, the
+// models and the accounts it may use.
 type Identity struct {
 	KeyID, KeyName string
 	Limit          *Limit
+	More           []Limit
+	Models         []string
+	Accounts       []string
+	Quotas         bool
 }
 type contextKey struct{}
 
@@ -53,7 +152,10 @@ func WithIdentity(ctx context.Context, who Identity) context.Context {
 }
 func Caller(ctx context.Context) Identity { who, _ := ctx.Value(contextKey{}).(Identity); return who }
 
-var mu sync.Mutex
+// mu is held for every read of caller-keys.json a change is made from,
+// and the write, across magpies too (#1674): a key revoked with magpie
+// keys while the window adds one is never written back.
+var mu = filelock.Mutex{Path: func() string { return Path() + ".lock" }}
 
 func Path() string { return filepath.Join(settings.Dir(), "caller-keys.json") }
 
@@ -87,9 +189,74 @@ func List() ([]Key, error) {
 			}
 			k.Masked = prefix + "…" + k.Secret[len(k.Secret)-6:]
 		}
+		if k.Secret != "" && !Managed(k.Secret) { // a key of the user's own: only its end
+			k.Masked = "…"
+			if len(k.Secret) >= 12 {
+				k.Masked += k.Secret[len(k.Secret)-4:]
+			}
+		}
 		k.Secret = ""
 	}
 	return keys, nil
+}
+
+// LANSecret is the key magpie shares the gateway on the local network with
+// (the default key ConfigureLAN made), for an agent of this computer's that
+// reaches it from beyond loopback — one in a WSL distro under NAT, whose
+// requests the gateway takes only with a named key; "" while the gateway
+// isn't shared, or that key is off.
+func LANSecret() string {
+	// not shared, the usual case, is told by the settings alone, before
+	// the lock: taken first, every agent's sync (keeping) made and locked
+	// caller-keys.json.lock, ~100 times in a start's first 20s (#1665)
+	if !settings.Load().LAN {
+		return ""
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	s := settings.Load()
+	if !s.LAN {
+		return ""
+	}
+	keys, err := load()
+	if err != nil {
+		return ""
+	}
+	if i := slices.IndexFunc(keys, func(k Key) bool { return k.ID == s.LANKeyID || k.LAN }); i >= 0 {
+		if keys[i].Off {
+			return ""
+		}
+		return keys[i].Secret
+	}
+	if s.LANKeyID == "" && s.LANKey != "" && !strings.HasPrefix(s.LANKey, revokedLANPrefix) {
+		return s.LANKey
+	}
+	return ""
+}
+
+// Default says secret is the sharing key magpie itself made (the default
+// key ConfigureLAN keeps), whether sharing is on now or not: magpie's own,
+// never one the user brought, so a write that keeps "a caller key of the
+// gateway's own the user put there" must not keep it (#2545: with sharing
+// off the key stays enabled in the store, Authenticate still took it, and
+// Rekey could no longer bring gateway.Token back). An older magpie kept it
+// in the settings alone; that value answers too, short of its revoked
+// mirror.
+func Default(secret string) bool {
+	if secret == "" {
+		return false
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	s := settings.Load()
+	keys, err := load()
+	if err == nil {
+		if i := slices.IndexFunc(keys, func(k Key) bool { return k.LAN || k.ID == s.LANKeyID }); i >= 0 {
+			return subtle.ConstantTimeCompare([]byte(secret), []byte(keys[i].Secret)) == 1
+		}
+	}
+	return s.LANKey != "" && !strings.HasPrefix(s.LANKey, revokedLANPrefix) &&
+		subtle.ConstantTimeCompare([]byte(secret), []byte(s.LANKey)) == 1
 }
 
 // Export returns credentials only for the encrypted backup bundle.
@@ -119,7 +286,27 @@ type Change struct {
 	Name string `json:"name"`
 	// Limit is what "limit-key" sets; nil or Unlimited takes the limit off.
 	Limit *Limit `json:"limit,omitempty"`
+	// Index is which of the key's limits "limit-key" sets and
+	// "reset-limit-key" resets (#2227), counted from 0: one past the last
+	// adds a limit, a nil Limit there removes that one. Without it,
+	// "limit-key" makes Limit the key's only limit, and "reset-limit-key"
+	// resets every one.
+	Index *int `json:"index,omitempty"`
+	// Models is what "models-key" sets; none lets the key use every model.
+	Models []string `json:"models,omitempty"`
+	// Accounts is what "accounts-key" sets (#905); none lets the key use
+	// every account and key.
+	Accounts []string `json:"accounts,omitempty"`
+	// Quotas is what "quotas-key" sets (#2216).
+	Quotas bool `json:"quotas,omitempty"`
+	// Secret is the value "add-key" gives the new key, one its clients
+	// already send (love1sbug on X: keys handed out from another gateway);
+	// "" for one magpie makes.
+	Secret string `json:"secret,omitempty"`
 }
+
+// Now is when Update sets or resets a limit. A variable for the tests.
+var Now = time.Now
 
 // Update writes the named key store atomically.
 func Update(action string, in Change) (string, error) {
@@ -142,11 +329,17 @@ func Update(action string, in Change) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		token, err := random(24)
-		if err != nil {
-			return "", err
+		if in.Secret != "" {
+			if secret, err = ownSecret(in.Secret, keys); err != nil {
+				return "", err
+			}
+		} else {
+			token, err := random(24)
+			if err != nil {
+				return "", err
+			}
+			secret = Prefix + token
 		}
-		secret = Prefix + token
 		keys = append(keys, Key{ID: id, Name: name, Secret: secret})
 	} else {
 		i := slices.IndexFunc(keys, func(k Key) bool { return k.ID == in.Key })
@@ -172,7 +365,81 @@ func Update(action string, in Change) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			keys[i].Limit = lim
+			ls := keys[i].limitList()
+			now := Now().Round(0)
+			if in.Index == nil {
+				var first *Limit
+				if len(ls) > 0 {
+					first = &ls[0]
+				}
+				ls = nil
+				if lim != nil {
+					lim.Since = sinceOf(first, lim, now)
+					ls = []Limit{*lim}
+				}
+			} else {
+				n := *in.Index
+				if n < 0 || n > len(ls) || (n == len(ls) && lim == nil) {
+					return "", errors.New("This key has no such limit")
+				}
+				switch {
+				case lim == nil:
+					ls = slices.Delete(ls, n, n+1)
+				case n == len(ls):
+					if len(ls) >= MaxLimits {
+						return "", fmt.Errorf("A key can have at most %d limits", MaxLimits)
+					}
+					lim.Since = sinceOf(nil, lim, now)
+					ls = append(ls, *lim)
+				default:
+					lim.Since = sinceOf(&ls[n], lim, now)
+					ls[n] = *lim
+				}
+			}
+			for a := range ls {
+				for b := a + 1; b < len(ls); b++ {
+					if ls[a].sameWindow(&ls[b]) {
+						return "", fmt.Errorf("This key already has a limit %s: change that one instead", ls[a].Per())
+					}
+				}
+			}
+			keys[i].setLimits(ls)
+		case "reset-limit-key":
+			// what the key has used is counted again from now (#1509),
+			// its tokens and cost together: a "days" or "hours" cycle starts anew,
+			// a calendar window keeps its end; one limit of several, or
+			// every one (#2227)
+			ls := keys[i].limitList()
+			if len(ls) == 0 {
+				return "", errors.New("This key has no limit to reset")
+			}
+			now := Now().Round(0)
+			if in.Index != nil {
+				n := *in.Index
+				if n < 0 || n >= len(ls) {
+					return "", errors.New("This key has no such limit")
+				}
+				ls[n].Since = now
+			} else {
+				for j := range ls {
+					ls[j].Since = now
+				}
+			}
+			keys[i].setLimits(ls)
+		case "models-key":
+			ms, err := CleanModels(in.Models)
+			if err != nil {
+				return "", err
+			}
+			keys[i].Models = ms
+		case "accounts-key":
+			as, err := CleanAccounts(in.Accounts)
+			if err != nil {
+				return "", err
+			}
+			keys[i].Accounts = as
+		case "quotas-key":
+			keys[i].Quotas = in.Quotas
 		case "on-key", "off-key":
 			keys[i].Off = action == "off-key"
 		case "remove-key":
@@ -187,7 +454,7 @@ func Update(action string, in Change) (string, error) {
 		default:
 			return "", fmt.Errorf("unknown key action %q", action)
 		}
-		if defaultKey && action != "remove-key" && action != "rename-key" && action != "limit-key" {
+		if defaultKey && action != "remove-key" && action != "rename-key" && action != "limit-key" && action != "reset-limit-key" && action != "models-key" && action != "accounts-key" && action != "quotas-key" {
 			mirror = &keys[i]
 		}
 	}
@@ -234,7 +501,7 @@ func Authenticate(secret string) (Identity, bool) {
 			if k.Off {
 				return Identity{}, false
 			}
-			return Identity{k.ID, k.Name, k.Limit}, true
+			return Identity{KeyID: k.ID, KeyName: k.Name, Limit: k.Limit, More: k.More, Models: k.Models, Accounts: k.Accounts, Quotas: k.Quotas}, true
 		}
 	}
 	s := settings.Load()
@@ -295,9 +562,22 @@ func migrateLegacyLANKey() error {
 	return settings.Save(s)
 }
 
+// LANChanged is called after sharing is turned on or off, or its key made
+// anew: what was given the key goes on with the one there is now (the
+// library's MCP servers relayed to an agent in a WSL distro under NAT).
+var LANChanged = func() {}
+
 // ConfigureLAN starts sharing with a named key. Rotation preserves the key's
 // identity, name and enabled state.
 func ConfigureLAN(on, rotate bool) error {
+	if err := configureLAN(on, rotate); err != nil {
+		return err
+	}
+	LANChanged()
+	return nil
+}
+
+func configureLAN(on, rotate bool) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if err := migrateLegacyLANKey(); err != nil {
@@ -310,6 +590,14 @@ func ConfigureLAN(on, rotate bool) error {
 			return err
 		}
 		i := slices.IndexFunc(keys, func(k Key) bool { return k.ID == s.LANKeyID || k.LAN })
+		// a default key the user removed stays removed when sharing is
+		// turned on again: making a fresh "Magpie" key then read as a
+		// default key that keeps coming back beside the user's own
+		// (#1655, GradientLive). Only an explicit new key makes one.
+		if i < 0 && !rotate && removedDefault(s) {
+			s.LAN = on
+			return settings.Save(s)
+		}
 		if i < 0 || rotate {
 			token, err := random(24)
 			if err != nil {
@@ -335,6 +623,13 @@ func ConfigureLAN(on, rotate bool) error {
 	}
 	s.LAN = on
 	return settings.Save(s)
+}
+
+// removedDefault: sharing made a default key before and it is no longer in
+// the store — its id is recorded (LANKeyID), or an older magpie that
+// drops that id kept only the revoked mirror Update leaves behind.
+func removedDefault(s settings.Settings) bool {
+	return s.LANKeyID != "" || strings.HasPrefix(s.LANKey, revokedLANPrefix)
 }
 
 func save(keys []Key) error {

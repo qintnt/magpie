@@ -115,7 +115,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // the request archive's switch, over the Usage page's requests
       await page.locator('[data-view="usage"]').first().click();
-      await page.locator("#usageTab .opt").nth(1).click();
+      await page.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       const sw = page.locator("#ledArchive .led-arch-sw");
       await sw.waitFor();
       assert.equal(await sw.textContent(), w.name);
@@ -131,7 +131,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // the Usage page's chart, its ranking by provider with their icons
       await page.locator("#ledRank .rk").first().waitFor();
-      await page.locator("#ledSplit .opt").filter({ hasText: w.provider }).click();
+      await page.locator("#ledSplit").getByText(w.provider, { exact: true }).click();
       assert((await page.locator("#ledChart rect.col").count()) > 0, "the chart drew no columns");
       const icons = page.locator("#ledRank .rk .ic img");
       await page.waitForFunction(() => {

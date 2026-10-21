@@ -6,11 +6,13 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 func TestBootScript(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	// Spaces, quotes and shell expansions must stay part of the file name.
 	exe := filepath.Join(home, "magpie ' $not_a_variable")
 	out := filepath.Join(home, "args")
@@ -23,13 +25,13 @@ func TestBootScript(t *testing.T) {
 	if err := os.Chmod(record(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if Enabled() {
+	if Enabled() != Off {
 		t.Fatal("non-executable script reported as enabled")
 	}
 	if err := enable(exe); err != nil {
 		t.Fatal(err)
 	}
-	if !Enabled() {
+	if Enabled() == Off {
 		t.Fatal("enable did not restore executable permission")
 	}
 	if err := exec.Command("/system/bin/sh", record()).Run(); err != nil {

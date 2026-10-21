@@ -46,7 +46,11 @@
     <a href="/docs/ja/start">はじめに</a>
     <a href="/docs/ja/intent">インテントルーティング</a>
     <a href="/docs/ja/plugins">プラグイン</a>
+    <a class="toc-only" href="/docs/ja/remote">リモート magpie</a>
+    <a class="toc-only" href="/docs/ja/docker">Docker</a>
+    <a class="toc-only" href="/docs/ja/privacy">プライバシー</a>
     <a href="/docs/ja/import">magpie に追加</a>
+    <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie-releases/releases">リリース</a>
   </div>
   <div class="langs">
@@ -85,12 +89,12 @@
     <p class="lede">ユーザーが何を求めているかで、ターンを送るモデルを決めます。テストは強いモデルへ、ちょっとした質問は速くて安いモデルへ。それぞれの種類を数語で書いておけば、ターンの始まりに、あなたが選んだ小さなモデルがメッセージの種類を判定します。</p>
 
     <figure class="figure">
-      <img class="for-light" src="/img/intent-rules-light.png" width="2060" height="1590" alt="ルーティンググループの編集画面：ルールが 3 つあり、そのうち 2 つにインテント（asks for “a quick question”、asks for “writing or fixing tests”）が付き、Intent told by は Groq の llama-3.1-8b-instant">
-      <img class="for-dark" src="/img/intent-rules-dark.png" width="2060" height="1590" alt="ルーティンググループの編集画面：ルールが 3 つあり、そのうち 2 つにインテント（asks for “a quick question”、asks for “writing or fixing tests”）が付き、Intent told by は Groq の llama-3.1-8b-instant">
+      <img class="for-light" src="/img/intent-rules-ja-light.png" width="2012" height="2538" alt="ルーティンググループの編集画面：ルールが 3 つあり、そのうち 2 つにインテント（“a quick question” と “writing or fixing tests”）が付き、インテント判定は Groq の llama-3.1-8b-instant">
+      <img class="for-dark" src="/img/intent-rules-ja-dark.png" width="2012" height="2538" alt="ルーティンググループの編集画面：ルールが 3 つあり、そのうち 2 つにインテント（“a quick question” と “writing or fixing tests”）が付き、インテント判定は Groq の llama-3.1-8b-instant">
       <figcaption>Coder グループ：長いターンは Kimi へ、ちょっとした質問は DeepSeek Flash へ、テストは DeepSeek Pro へ。インテントは Groq の Llama 3.1 8B が判定します。</figcaption>
     </figure>
 
-    <p>インテントは<a href="/docs/ja/start#rules">ルーティンググループのルール</a>に付けられる条件の一つで、長さ・画像・推理・エージェントと並びます。このページでは、v0.1.99 時点で magpie がインテントをどう扱うかを正確に説明します。すべての判断を予測でき、Routing タブで確かめられるようにするためです。</p>
+    <p>インテントは<a href="/docs/ja/start#rules">ルーティンググループのルール</a>に付けられる条件の一つで、長さ・画像・推理・エージェントと並びます。このページでは、v0.1.99 時点で magpie がインテントをどう扱うかを正確に説明します。すべての判断を予測でき、ルーティングタブで確かめられるようにするためです。</p>
 
     <div class="callout"><b>ひとことで言うと。</b>magpie の判断はターンごとに 1 回です。あなたがメッセージを送ったときに決め、エージェントがツール呼び出しを重ねている間には決めません。インテント付きのルールが最初に一致する可能性があれば、magpie は自分のゲートウェイを通して、グループの<em>判定モデル</em>に短い質問を 1 つ送ります。質問には番号付きのインテント一覧と、あなたの最新メッセージのテキストが入っていて、判定モデルは番号で答えます。magpie はその番号を使ってルールを上から順に照合します。最初に一致したルールのモデルが先頭になり、グループのほかのモデルはフェイルオーバー用としてその後ろに残ります。以後、あなたが次に発言するまで、ターンはそのモデルに留まります。判定モデルが失敗したり、タイムアウトしたり、番号以外を答えたりした場合は、どのインテントも一致せず、そうしたルールがないものとしてルーティングされます。埋め込みもキーワードリストも学習もありません。あなたが選んだモデルがメッセージを読み、番号を選ぶだけです。</div>
 
@@ -98,8 +102,8 @@
     <p>モデルが 2 つ以上ある<a href="/docs/ja/start#routing">ルーティンググループ</a>と、判定用のモデルがもう 1 つ必要です。判定モデルは magpie にあるモデルならどれでもよく、グループに入っているかどうかは問いません。</p>
     <ol class="steps">
       <li><b>グループを開く</b><span class="ui">Routing</span> を開き、<em>Routing groups</em> からグループを探して <span class="ui">Edit</span> をクリックします。</li>
-      <li><b>インテント付きのルールを追加する</b><span class="ui">Add a rule</span> をクリックし、<span class="ui">send to</span> でモデルを選び、<span class="ui">asks for</span> をクリックして、メッセージが求めていることを書きます（例：<em>writing or fixing tests</em>）。同じルールのほかの条件も満たされている必要があります。</li>
-      <li><b>判定モデルを選ぶ</b>ルールにインテントが付くと <span class="ui">Intent told by</span> が表示されます。推理なしの、小さく速いモデルを選んでください。インテントがあって判定モデルがないグループは保存できません。</li>
+      <li><b>インテント付きのルールを追加する</b><span class="ui">ルールを追加</span> をクリックします。新しいルールは <span class="ui">インテント</span> → モデル の 1 行で、インテント欄にカーソルがあります。メッセージが求めていることを書き（例：<em>writing or fixing tests</em>）、→ の後でモデルを選びます。ほかの条件はルールの <span class="ui">+</span> から追加し、それらも満たされている必要があります。</li>
+      <li><b>判定モデルを選ぶ</b>ルールにインテントが付くと <span class="ui">Intent told by</span> が表示されます。TypeSafe プロバイダーがあれば Jev が選ばれ、なければ推理なしの、小さく速いモデルを選んでください。推論の強さをすでに Jev が選んでいるグループでは、判定モデルの下に同じ入口（<span class="ui">It can pick the model too</span>）があります。インテントがあって判定モデルがないグループは保存できません。</li>
       <li><b>保存して、メッセージを送る</b>変更は次のターンから反映され、再起動は不要です。<span class="ui">Routing</span> タブに、判定モデルの答えとターンの行き先が表示されます。</li>
     </ol>
     <p>ターミナルからも同じことができます。</p>
@@ -108,12 +112,15 @@
       <button class="copy" data-copy="ex-cli">コピー</button>
       <pre id="ex-cli">magpie group rule add coder use=deepseek/deepseek-v4-flash intent=<span class="s">"a quick question"</span> classifier=groq/llama-3.1-8b-instant
 magpie group rule add coder use=deepseek/deepseek-v4-pro intent=<span class="s">"writing or fixing tests"</span>
+magpie group rule add coder use=deepseek/deepseek-v4-pro use-effort=low intent=<span class="s">"a simple edit"</span>   <span class="c"># 同じモデルを low の推論で</span>
 magpie group rule coder                           <span class="c"># the rules, numbered, and the classifier</span>
 magpie group rule classifier coder groq/llama-3.1-8b-instant   <span class="c"># change the classifier</span>
 magpie group rule mv coder 3 1                    <span class="c"># order matters: top first</span>
 magpie group rule rm coder 2</pre>
     </div>
     <p><code>intent=</code> は <code>asks=</code> と <code>about=</code> とも書けます。<code>classifier=</code> は <code>classify=</code> と <code>by=</code> とも書けます。<code>rule add</code> の <code>classifier=</code> はグループの判定モデルを設定するもので、最初の 1 回だけ必要です。判定モデルは <code>~/.config/magpie/providers.json</code> のグループのレコードに <code>"classifier"</code> として、各ルールは <code>{"use": …, "intent": …}</code> として保存されます。</p>
+
+    <p id="effort">ルールはモデルに求める推論も指定できるので、意図でモデルと推論の強さを組で選べます。<code>use-effort=</code>（<code>low</code>、<code>medium</code>、<code>high</code>、<code>xhigh</code>、<code>max</code>）で、<code>"useEffort"</code> として保存されます。例：<code>{"use": "deepseek/deepseek-v4-pro", "intent": "a simple edit", "useEffort": "low"}</code>。エディタではルールの <span class="ui">⋯</span> メニューの <span class="ui">推論を指定</span> から設定し、設定するとモデルの横に表示されます。そのターンのリクエストでは、エージェントの指定にかかわらず、ルールのモデルにその推論をモデルの最も近いレベルで求めます。magpie がレベルを知らないモデルはエージェントの指定どおりで、グループがフェイルオーバーする先のモデルも同じです。グループで推論が固定されたモデルはその固定のままです。指定しなければエージェントの指定どおりです。ルールが推論を指定したときは、ルーティングタブにそう表示されます。</p>
 
     <h2 id="how"><a class="anchor" href="#how">ターンのルーティング</a></h2>
     <p>ルールのあるグループにエージェントが送るリクエストは、すべて次の手順をこの順に通ります。</p>
@@ -144,8 +151,8 @@ magpie group rule rm coder 2</pre>
     <h3>アプリでの様子</h3>
     <p>インテント付きのルールが 2 つ（“a quick question or explanation, with no code to write or change” と “writing or fixing tests”）あるグループに、Claude Code から実際のリクエストを送った例です。内容は「Add unit tests for the LRU cache in cache.go, covering eviction and concurrent reads and writes」。<span class="ui">Routing</span> タブにリアルタイムで表示されます。</p>
     <figure class="figure">
-      <img class="for-light" src="/img/intent-routing-hit-light.png" width="2080" height="1116" loading="lazy" alt="Routing タブ：Claude Code から magpie を経て aihubmix/glm-5.3 が回答。トレースには、deepseek-flash が 964 ms で答えたとおりルール 2 が “writing or fixing tests” に一致したと書かれている">
-      <img class="for-dark" src="/img/intent-routing-hit-dark.png" width="2080" height="1116" loading="lazy" alt="Routing タブ：Claude Code から magpie を経て aihubmix/glm-5.3 が回答。トレースには、deepseek-flash が 964 ms で答えたとおりルール 2 が “writing or fixing tests” に一致したと書かれている">
+      <img class="for-light" src="/img/intent-routing-hit-ja-light.png" width="2080" height="1190" loading="lazy" alt="ルーティングタブ：Claude Code から magpie を経て aihubmix/glm-5.3 が回答。トレースには、deepseek-flash が 964 ms で答えたとおりルール 2 が “writing or fixing tests” に一致したと書かれている">
+      <img class="for-dark" src="/img/intent-routing-hit-ja-dark.png" width="2080" height="1190" loading="lazy" alt="ルーティングタブ：Claude Code から magpie を経て aihubmix/glm-5.3 が回答。トレースには、deepseek-flash が 964 ms で答えたとおりルール 2 が “writing or fixing tests” に一致したと書かれている">
       <figcaption>判定モデル（deepseek-flash）は 964 ms で “writing or fixing tests” と答え、ルール 2 がグループのいつもの先頭モデルより前に glm-5.3 を置きました。glm-5.3 は 5.6 秒で回答しています。</figcaption>
     </figure>
 
@@ -203,8 +210,8 @@ The number of its kind (0 for none):</pre>
     <h2 id="trace"><a class="anchor" href="#trace">トレースの読み方</a></h2>
     <p><span class="ui">Routing</span> タブには、各グループの最新のリクエストについて、どのモデルが答えたか、そして <span class="ui">How the last request was routed</span> の下にその理由が表示されます。</p>
     <figure class="figure">
-      <img class="for-light" src="/img/intent-trace-light.png" width="2064" height="898" loading="lazy" alt="リクエスト後の Routing タブ：Claude Code から magpie を経て DeepSeek の deepseek-v4-pro へ。トレースにはルール 3 が一致したことと判定モデルの答えが書かれている">
-      <img class="for-dark" src="/img/intent-trace-dark.png" width="2064" height="898" loading="lazy" alt="リクエスト後の Routing タブ：Claude Code から magpie を経て DeepSeek の deepseek-v4-pro へ。トレースにはルール 3 が一致したことと判定モデルの答えが書かれている">
+      <img class="for-light" src="/img/intent-trace-ja-light.png" width="2016" height="970" loading="lazy" alt="リクエスト後の ルーティングタブ：Claude Code から magpie を経て DeepSeek の deepseek-v4-pro へ。トレースにはルール 3 が一致したことと判定モデルの答えが書かれている">
+      <img class="for-dark" src="/img/intent-trace-ja-dark.png" width="2016" height="970" loading="lazy" alt="リクエスト後の ルーティングタブ：Claude Code から magpie を経て DeepSeek の deepseek-v4-pro へ。トレースにはルール 3 が一致したことと判定モデルの答えが書かれている">
       <figcaption>テストを求めるメッセージ：判定モデルが 323 ms で “writing or fixing tests” と答え、ルール 3 が deepseek-v4-pro を先頭にしました。</figcaption>
     </figure>
     <p>インテントに関してトレースに出る行は次のとおりです。</p>
@@ -215,7 +222,7 @@ The number of its kind (0 for none):</pre>
       <tr><td>… (said before, for the same message).</td><td>答えは 10 分間のキャッシュから取ったもので、呼び出しはしていません。</td></tr>
       <tr><td>… was to tell which … but couldn’t — <em>reason</em> — so no rule with an intent matches it.</td><td>失敗しました。理由はエラー、タイムアウト、返ってきた答え、または失敗後の休止中であることです。</td></tr>
       <tr><td>Turn N begins and rule R matches — asks for “B” — so M goes first …</td><td>採用されたルールと、先頭になったモデルです。</td></tr>
-      <tr><td>Rule R matches, but M has nothing ready now, so the group’s order stands.</td><td>ルールのモデルに、いま使えるキーやアカウントがありません。</td></tr>
+      <tr><td>Rule R matches, but M has no account or key that can take this request, so the group’s order stands.</td><td>ルールのモデルには、このリクエストを処理できるアカウントやキーがありません。</td></tr>
       <tr><td>Rule R (…) sent turn N to M as it began; the turn stays there.</td><td>ターン内のツールのやり取りで、ターン開始時の判断に従っています。</td></tr>
       <tr><td>This turn began before magpie saw it, so the rules wait for the next one.</td><td>上の<em>待機</em>を参照してください。</td></tr>
     </table></div>
@@ -274,7 +281,7 @@ The number of its kind (0 for none):</pre>
     <ul>
       <li>それより上のルールが先に一致した。</li>
       <li>ルールのほかの条件（トークン数・画像・推理・エージェント）が満たされなかった。</li>
-      <li>ルールのモデルに使えるものがなかった（“has nothing ready now”）。</li>
+      <li>ルールのモデルに、このリクエストを処理できるアカウントやキーがなかった。</li>
       <li>別のモデルで始まったターン内のツールのやり取りだった。</li>
       <li>magpie がターンの始まりを見ていなかった（“the rules wait”）。</li>
     </ul>
@@ -315,7 +322,11 @@ The number of its kind (0 for none):</pre>
     <a href="/ja/">ホーム</a>
     <a href="/docs/ja/intent">インテントルーティング</a>
     <a href="/docs/ja/plugins">プラグイン</a>
+    <a href="/docs/ja/remote">リモート magpie</a>
+    <a href="/docs/ja/docker">Docker</a>
+    <a href="/docs/ja/privacy">プライバシー</a>
     <a href="/docs/ja/import">magpie に追加</a>
+    <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>
     <a href="https://discord.gg/vGSnD3ZKQF">Discord</a>
     <a href="https://github.com/yetone/magpie-releases/releases">リリース</a>

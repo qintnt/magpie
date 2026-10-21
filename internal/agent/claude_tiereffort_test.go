@@ -65,7 +65,7 @@ func TestClaudeTierEffort(t *testing.T) {
 	if a.Field("haiku").Get() != "v/flash" || a.Field("haiku_effort").Get() != "low" || a.Field("sonnet_effort").Get() != "" {
 		t.Fatalf("read back: %v", a.Values())
 	}
-	if env("ANTHROPIC_MODEL") != "v/glm" || a.Field("effort").Get() != "high" || env("ANTHROPIC_DEFAULT_OPUS_MODEL") != "v/glm" {
+	if v, _ := edit.GetJSON(path, "model"); v != "v/glm" || env("ANTHROPIC_MODEL") != "" || a.Field("effort").Get() != "high" || env("ANTHROPIC_DEFAULT_OPUS_MODEL") != "v/glm" {
 		t.Fatalf("the main model's effort changed: %v", a.Values())
 	}
 	// a tier following the main model, at another effort
@@ -82,9 +82,10 @@ func TestClaudeTierEffort(t *testing.T) {
 	if env(claudeContextEnv) != "200000" {
 		t.Fatalf("window: %s", env(claudeContextEnv))
 	}
-	// the effort stays with the tier through a new model, and back to the
-	// main model's
-	set("haiku", "v/glm")
+	// the effort stays with the tier through a new model, and back to
+	// following the main model ("Same as main model"; the main model
+	// picked by name is the tier's own, #2654)
+	set("haiku", "")
 	if env("ANTHROPIC_DEFAULT_HAIKU_MODEL") != "v/glm:low" || a.Field("haiku").Get() != "" {
 		t.Fatalf("haiku on the main model: %v", a.Values())
 	}
@@ -92,7 +93,7 @@ func TestClaudeTierEffort(t *testing.T) {
 	// one of its own keeps its model
 	set("model", "v/flash")
 	if env("ANTHROPIC_DEFAULT_SONNET_MODEL") != "v/flash:medium" || env("ANTHROPIC_DEFAULT_HAIKU_MODEL") != "v/flash:low" ||
-		env("ANTHROPIC_DEFAULT_OPUS_MODEL") != "v/big:high[1m]" || env("ANTHROPIC_DEFAULT_FABLE_MODEL") != "v/flash" {
+		env("ANTHROPIC_DEFAULT_OPUS_MODEL") != "v/big:high[1m]" || env("ANTHROPIC_DEFAULT_FABLE_MODEL") != "" {
 		t.Fatalf("new main model: %v", a.Values())
 	}
 	// the tier's effort taken away: its model as before
@@ -109,7 +110,7 @@ func TestClaudeTierEffort(t *testing.T) {
 	// their own, kept through a new main model
 	set("opus", "")
 	set("opus_effort", "")
-	if env("CLAUDE_CODE_SUBAGENT_MODEL") != "v/flash" {
+	if env("CLAUDE_CODE_SUBAGENT_MODEL") != "" {
 		t.Fatalf("subagents follow: %v", a.Values())
 	}
 	set("subagent_effort", "low")
@@ -126,7 +127,7 @@ func TestClaudeTierEffort(t *testing.T) {
 	}
 	set("subagent", "")
 	set("subagent_effort", "")
-	if env("CLAUDE_CODE_SUBAGENT_MODEL") != "v/glm" || a.Field("subagent_effort").Get() != "" {
+	if env("CLAUDE_CODE_SUBAGENT_MODEL") != "" || a.Field("subagent_effort").Get() != "" {
 		t.Fatalf("subagents back: %v", a.Values())
 	}
 	// back to Claude Code as installed: nothing of magpie's left

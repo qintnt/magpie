@@ -264,9 +264,30 @@ func TestIsOpenCode(t *testing.T) {
 
 // A plan with no list to ask gives its own models and asks nothing.
 func TestFetchPlanWithoutList(t *testing.T) {
-	p := Provider{ID: "plan", Chat: "http://127.0.0.1:1/v2", Account: &Account{Agent: "plan", models: func() []catalog.Model { return wbModels }}}
+	own := []catalog.Model{{ID: "auto", Name: "Auto"}, {ID: "hy3", Name: "Hy3"}}
+	p := Provider{ID: "plan", Chat: "http://127.0.0.1:1/v2", Account: &Account{Agent: "plan", models: func() []catalog.Model { return own }}}
 	ms, err := p.Fetch(context.Background())
-	if err != nil || len(ms) != len(wbModels) {
+	if err != nil || len(ms) != len(own) {
 		t.Errorf("%d models, %v", len(ms), err)
+	}
+}
+
+// A model its vendor lists with no name is called by its id, in the
+// catalog and so in every agent's list (#955: an unnamed one showed as
+// magpie/antigravity/gemini-3.6-flash-tiered); a name the user gave it
+// still wins, its vendor's then being the id.
+func TestEntryForUnnamedModel(t *testing.T) {
+	p := Provider{ID: "acme", Name: "Acme"}
+	e := entryFor(p, catalog.Model{ID: "m-1"}, settings.Settings{})
+	if e.Name != "m-1" || e.Label() != "m-1 · Acme" {
+		t.Fatalf("name %q, label %q", e.Name, e.Label())
+	}
+	e = entryFor(p, catalog.Model{ID: "m-1", Name: "Model One"}, settings.Settings{})
+	if e.Name != "Model One" {
+		t.Fatalf("name %q", e.Name)
+	}
+	e = entryFor(p, catalog.Model{ID: "m-1"}, settings.Settings{ModelNames: map[string]string{"acme/m-1": "Mine"}})
+	if e.Name != "Mine" || e.Default != "m-1" {
+		t.Fatalf("name %q, default %q", e.Name, e.Default)
 	}
 }

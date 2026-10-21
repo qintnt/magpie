@@ -16,6 +16,7 @@ package provider
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -23,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -317,6 +319,27 @@ var googleState = struct {
 
 type googleProject struct {
 	id, plan string
+	// the tiers loadCodeAssist gave (Antigravity's): the one the account
+	// is on ("free-tier", "standard-tier") and the Google One plan it pays
+	// for ("g1-pro-tier"), "" when not known
+	tier, paid string
+}
+
+// entitlements are the tiers to name in fetchAvailableModels'
+// entitlement.userTier, best first. Antigravity's language server keeps
+// the account's tier (SetUserTier, with the plan's name: "Google AI Pro")
+// and sends it there (FetchAvailableModelsRequest.entitlement, the only
+// request of Code Assist's that has one); Google takes a paid tier only
+// from an account that has it (FAILED_PRECONDITION else). A free account
+// names none (Google refuses "free-tier" there), as before.
+func (p googleProject) entitlements() []string {
+	var out []string
+	for _, t := range []string{p.paid, p.tier} {
+		if t != "" && t != "free-tier" && t != "legacy-tier" && !slices.Contains(out, t) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // token is a live access token for the account.
@@ -448,6 +471,7 @@ type codeAssistTier struct {
 	Name                               string `json:"name"`
 	IsDefault                          bool   `json:"isDefault"`
 	UserDefinedCloudaicompanionProject bool   `json:"userDefinedCloudaicompanionProject"`
+	UsesGcpTos                         bool   `json:"usesGcpTos"`
 }
 
 // companionProject is Code Assist's project, which comes as an id or as
@@ -502,10 +526,48 @@ type loadCodeAssistReply struct {
 	AllowedTiers            []codeAssistTier `json:"allowedTiers"`
 	CloudaicompanionProject companionProject `json:"cloudaicompanionProject"`
 	IneligibleTiers         []struct {
-		ReasonCode    string `json:"reasonCode"`
-		ReasonMessage string `json:"reasonMessage"`
-		TierID        string `json:"tierId"`
+		ReasonCode             string `json:"reasonCode"`
+		ReasonMessage          string `json:"reasonMessage"`
+		TierID                 string `json:"tierId"`
+		ValidationErrorMessage string `json:"validationErrorMessage"`
 	} `json:"ineligibleTiers"`
+}
+
+// tiers are the ids of the tier the account is on and the one it pays for.
+func (r loadCodeAssistReply) tiers() (current, paid string) {
+	if r.CurrentTier != nil {
+		current = r.CurrentTier.ID
+	}
+	if r.PaidTier != nil {
+		paid = r.PaidTier.ID
+	}
+	return current, paid
+}
+
+// describe is what loadCodeAssist said of the account, for the log.
+func (r loadCodeAssistReply) describe() string {
+	tier := func(t *codeAssistTier) string {
+		if t == nil {
+			return "-"
+		}
+		s := t.ID
+		if t.Name != "" {
+			s += " (" + t.Name + ")"
+		}
+		if t.UsesGcpTos {
+			s += " gcp-tos"
+		}
+		return s
+	}
+	s := fmt.Sprintf("current tier %s, paid tier %s, project %q", tier(r.CurrentTier), tier(r.PaidTier), string(r.CloudaicompanionProject))
+	for _, t := range r.IneligibleTiers {
+		why := t.ReasonCode
+		if m := cmp.Or(t.ReasonMessage, t.ValidationErrorMessage); m != "" {
+			why += ": " + m
+		}
+		s += fmt.Sprintf(", ineligible %s (%s)", t.TierID, why)
+	}
+	return s
 }
 
 func (r loadCodeAssistReply) plan() string {
@@ -549,10 +611,10 @@ func (g googleAccount) geminiProject(ctx context.Context) (googleProject, error)
 	}
 	if load.CurrentTier != nil {
 		if load.CloudaicompanionProject != "" {
-			return googleProject{string(load.CloudaicompanionProject), load.plan()}, nil
+			return googleProject{id: string(load.CloudaicompanionProject), plan: load.plan()}, nil
 		}
 		if want != "" {
-			return googleProject{want, load.plan()}, nil
+			return googleProject{id: want, plan: load.plan()}, nil
 		}
 		return googleProject{}, g.needsProject("")
 	}
@@ -581,7 +643,7 @@ func (g googleAccount) geminiProject(ctx context.Context) (googleProject, error)
 	if id == "" {
 		return googleProject{}, g.needsProject("")
 	}
-	return googleProject{id, tier.Name}, nil
+	return googleProject{id: id, plan: tier.Name}, nil
 }
 
 // needsProject says a Code Assist Standard or Enterprise account needs a
@@ -599,17 +661,28 @@ func (g googleAccount) needsProject(why string) error {
 }
 
 // antigravityProject sets the account up as Antigravity does.
+// A project kept with the sign-in is still the one used, but the account's
+// tiers are asked for all the same: fetchAvailableModels names them.
 func (g googleAccount) antigravityProject(ctx context.Context) (googleProject, error) {
-	if g.auth.Project != "" {
-		return googleProject{id: g.auth.Project}, nil
-	}
 	var load loadCodeAssistReply
 	body := map[string]any{"metadata": map[string]any{"ideType": "ANTIGRAVITY"}}
-	if err := g.call(ctx, g.app.loadBase, "loadCodeAssist", body, &load, nil); err != nil {
+	err := g.call(ctx, g.app.loadBase, "loadCodeAssist", body, &load, nil)
+	if err == nil {
+		log.Printf("antigravity %s: loadCodeAssist at %s: %s", g.user, g.app.loadBase, load.describe())
+	}
+	cur, paid := load.tiers()
+	if g.auth.Project != "" {
+		if err != nil {
+			log.Printf("antigravity %s: loadCodeAssist: %v; using the project kept with the sign-in, its tier not known", g.user, err)
+			return googleProject{id: g.auth.Project}, nil
+		}
+		return googleProject{id: g.auth.Project, plan: load.plan(), tier: cur, paid: paid}, nil
+	}
+	if err != nil {
 		return googleProject{}, err
 	}
 	if load.CloudaicompanionProject != "" {
-		return googleProject{string(load.CloudaicompanionProject), load.plan()}, nil
+		return googleProject{id: string(load.CloudaicompanionProject), plan: load.plan(), tier: cur, paid: paid}, nil
 	}
 	tier := load.defaultTier()
 	if tier.ID == "" || tier.ID == "legacy-tier" {
@@ -637,7 +710,7 @@ func (g googleAccount) antigravityProject(ctx context.Context) (googleProject, e
 		}
 		return googleProject{}, errors.New(msg)
 	}
-	return googleProject{id, tier.Name}, nil
+	return googleProject{id: id, plan: tier.Name, tier: tier.ID, paid: paid}, nil
 }
 
 // onboardPoll is how long onboarding waits between asks; a var for tests.
@@ -854,6 +927,8 @@ func (g googleAccount) modelInfo(ctx context.Context) ([]googleModelInfo, error)
 		var res struct {
 			Models map[string]struct {
 				DisplayName     string `json:"displayName"`
+				Model           string `json:"model"` // its enum: MODEL_GOOGLE_GEMINI_2_5_FLASH, MODEL_PLACEHOLDER_M198
+				Disabled        bool   `json:"disabled"`
 				MaxTokens       int    `json:"maxTokens"`
 				MaxOutputTokens int    `json:"maxOutputTokens"`
 				SupportsImages  *bool  `json:"supportsImages"`
@@ -869,12 +944,49 @@ func (g googleAccount) modelInfo(ctx context.Context) ([]googleModelInfo, error)
 				} `json:"groups"`
 			} `json:"agentModelSorts"`
 		}
-		if err := g.call(ctx, g.app.base, "fetchAvailableModels", map[string]any{"project": p.id}, &res, nil); err != nil {
+		// with the account's tier named, as Antigravity asks; a tier Google
+		// won't take from it is left out, down to none
+		sent := ""
+		tiers := append(p.entitlements(), "")
+		for i, t := range tiers {
+			body := map[string]any{"project": p.id}
+			if t != "" {
+				body["entitlement"] = map[string]any{"userTier": t}
+			}
+			if err = g.call(ctx, g.app.base, "fetchAvailableModels", body, &res, nil); err == nil {
+				sent = t
+				break
+			}
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			switch {
+			case t == "":
+				log.Printf("antigravity %s: fetchAvailableModels at %s (project %q, no entitlement): %v", g.user, g.app.base, p.id, err)
+			case tiers[i+1] == "":
+				log.Printf("antigravity %s: fetchAvailableModels with entitlement %s: %v; asking with none next", g.user, t, err)
+			default:
+				log.Printf("antigravity %s: fetchAvailableModels with entitlement %s: %v; asking with %s next", g.user, t, err, tiers[i+1])
+			}
+		}
+		if err != nil {
 			return nil, err
 		}
+		var hidden, internal, disabled, claude []string
 		for id, m := range res.Models {
-			if antigravityHidden[id] || strings.HasPrefix(id, "chat_") || strings.HasPrefix(id, "tab_") {
+			switch {
+			case antigravityHidden[id]:
+				hidden = append(hidden, id)
 				continue
+			case strings.HasPrefix(id, "chat_") || strings.HasPrefix(id, "tab_"):
+				internal = append(internal, id)
+				continue
+			}
+			if m.Disabled {
+				disabled = append(disabled, id) // still listed, as before
+			}
+			if strings.HasPrefix(id, "claude") {
+				claude = append(claude, id)
 			}
 			mi := googleModelInfo{Model: catalog.Model{ID: id, Name: m.DisplayName,
 				Context: m.MaxTokens, Output: m.MaxOutputTokens, ImageInput: m.SupportsImages}, remaining: -1}
@@ -887,6 +999,35 @@ func (g googleAccount) modelInfo(ctx context.Context) ([]googleModelInfo, error)
 				mi.resets, _ = time.Parse(time.RFC3339, q.ResetTime)
 			}
 			out = append(out, mi)
+		}
+		// Antigravity lists a model it moved its users off under the name
+		// of the one it moved them to: gemini-2.5-flash and
+		// gemini-2.5-flash-lite come as "Gemini 3.5 Flash Lite", beside
+		// gemini-3.5-flash-lite itself, while each id is still answered
+		// by its own model (modelVersion gemini-2.5-flash), so the editor
+		// had three chips of one name and the first two weren't it
+		// (#1918, kchen0x). b68377dae told them by tagDescription, which
+		// then named the model moved to; Google has since left it empty
+		// or made it a notice ("GPT-OSS will be removed…"), and the chips
+		// came back (新v学员 on Discord, 10-20). Such a model is named for
+		// its own id when its enum names that id (MODEL_GOOGLE_GEMINI_2_5_
+		// FLASH, where the models Antigravity names truly are
+		// MODEL_PLACEHOLDER_M…), or when another family's model of that
+		// name is the one its name spells. Levels of one model
+		// (gemini-3.7-flash, -low) keep the name they share.
+		spelled := map[string]bool{}
+		for _, mi := range out {
+			if antigravityNameSpells(mi.Name, mi.ID) {
+				spelled[mi.Name] = true
+			}
+		}
+		for i, mi := range out {
+			if mi.Name == "" || antigravityNameSpells(mi.Name, mi.ID) {
+				continue
+			}
+			if spelled[mi.Name] || antigravityEnumNames(res.Models[mi.ID].Model, mi.ID) {
+				out[i].Name = catalog.NameOf(mi.ID) // "" is named later, by its id at the least
+			}
 		}
 		rank := map[string]int{}
 		for _, s := range res.AgentModelSorts {
@@ -901,6 +1042,12 @@ func (g googleAccount) modelInfo(ctx context.Context) ([]googleModelInfo, error)
 		for i := range out {
 			out[i].picker = rank[out[i].ID]
 		}
+		for _, l := range [][]string{hidden, internal, disabled, claude} {
+			slices.Sort(l)
+		}
+		log.Printf("antigravity %s: fetchAvailableModels at %s (%s; project %q, current tier %q, paid tier %q, entitlement %q): %d models, %d kept; left out %d not for chat %v, %d completion-only %v; disabled %v; Claude %v",
+			g.user, g.app.base, g.app.userAgent(""), p.id, p.tier, p.paid, sent, len(res.Models), len(out),
+			len(hidden), hidden, len(internal), internal, disabled, claude)
 	} else {
 		var res struct {
 			Buckets []struct {
@@ -1079,7 +1226,7 @@ func (g googleAccount) pools(ctx context.Context, ws []QuotaWindow) []QuotaWindo
 		if pool == "" {
 			continue
 		}
-		n := 0
+		n, fiveHour := 0, false
 		for _, b := range gr.Buckets {
 			if b.Disabled {
 				continue
@@ -1109,9 +1256,10 @@ func (g googleAccount) pools(ctx context.Context, ws []QuotaWindow) []QuotaWindo
 			}
 			out = append(out, w)
 			n++
+			fiveHour = fiveHour || w.Span == modelSpan
 		}
-		if n == 0 {
-			continue
+		if n == 0 || !fiveHour {
+			continue // without the group's 5 hours its models' own stand (#745)
 		}
 		// a model is in the group its name or description names its
 		// family in ("Models within this group: Claude Opus, Claude
@@ -1126,12 +1274,29 @@ func (g googleAccount) pools(ctx context.Context, ws []QuotaWindow) []QuotaWindo
 	return out
 }
 
+// modelSpan is the window fetchAvailableModels gives a model of
+// Antigravity's, its 5 hours, which its window leaves without a Span.
+const modelSpan = 5 * time.Hour
+
 // PooledWindows are ws as a page of text shows them: a pool's own windows,
 // named with their pool ("Gemini · 7 days"), in place of the per-model
-// windows drawing on it; ws as it is when it has no pool.
+// windows drawing on it; ws as it is when it has no pool. A model's window
+// goes only for a pool window of its span: one whose pool has only its
+// 7 days stays, the 5 hours it reads being the only ones to be had (#745).
 func PooledWindows(ws []QuotaWindow) []QuotaWindow {
 	if !slices.ContainsFunc(ws, func(w QuotaWindow) bool { return w.Pool != "" && w.Model == "" }) {
 		return ws
+	}
+	span := func(w QuotaWindow) time.Duration {
+		if w.Span == 0 && w.Model != "" {
+			return modelSpan
+		}
+		return w.Span
+	}
+	pooled := func(m QuotaWindow) bool {
+		return slices.ContainsFunc(ws, func(w QuotaWindow) bool {
+			return w.Pool == m.Pool && w.Model == "" && w.Span == span(m)
+		})
 	}
 	var out []QuotaWindow
 	for _, w := range ws {
@@ -1140,6 +1305,8 @@ func PooledWindows(ws []QuotaWindow) []QuotaWindow {
 			out = append(out, w)
 		case w.Model == "":
 			w.Name = w.Pool + " · " + w.Name
+			out = append(out, w)
+		case !pooled(w):
 			out = append(out, w)
 		}
 	}
@@ -1209,6 +1376,9 @@ func googleProvider(g googleAccount, plan string) Provider {
 	}
 	acct.models = g.fallbackModels
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
+		if g.app.agent == "antigravity" {
+			return antigravityPoolModels(ctx)
+		}
 		ms, err := g.models(ctx)
 		if err != nil {
 			return nil, err

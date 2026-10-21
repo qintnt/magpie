@@ -14,43 +14,31 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/filelock"
 )
 
 // savedTokenMu keeps two requests from refreshing one saved account at
-// once: the second would spend a refresh token the first just rotated.
-var savedTokenMu sync.Mutex
+// once: the second would spend a refresh token the first just rotated. It
+// holds across magpies too (#1674): the gateway's refresh and one by a
+// magpie run from a terminal would each spend the same refresh token.
+var savedTokenMu = filelock.Mutex{Path: func() string { return loginsPath() + ".renew.lock" }}
 
 // SetLoginOn puts a saved account in use beside the agent's own, or takes
 // it out. The account the agent is signed in to is always in use.
 func SetLoginOn(agent, user string, on bool) error {
+	if discoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	if pp, ok := pluginOfAgent(agent); ok {
 		return setPluginLoginOn(pp, user, on)
 	}
 	switch agent {
-	case "grok":
-		return setGrokLoginOn(user, on)
 	case "copilot":
 		return setCopilotLoginOn(user, on)
-	case "zcode":
-		return setZCodeLoginOn(user, on)
-	case "kiro":
-		return setKiroLoginOn(user, on)
-	case "devin":
-		return setDevinLoginOn(user, on)
-	case "workbuddy", WorkBuddyAIID:
-		return setWorkBuddyLoginOn(wbSiteOf(agent), user, on)
-	case CommandCodePlanID:
-		return setCommandCodeLoginOn(user, on)
-	case "qoder", QoderCNID:
-		return setSideLoginOn(agent, user, on, qoderLoginsOf(agent))
-	case "zed":
-		return setZedLoginOn(user, on)
-	case "factory":
-		return setFactoryLoginOn(user, on)
-	case MiMoID:
-		return setMiMoLoginOn(user, on)
+	case ChatGPTAPIID:
+		return setSIWCLoginOn(user, on)
 	case "gemini", "antigravity":
 		return setGoogleLoginOn(agent, user, on)
 	}
@@ -124,43 +112,31 @@ func (p Provider) OwnPaused() bool {
 }
 
 // AlsoOn is a signed-in agent's other accounts that are on, each as a
-// provider of its own, in the order they were saved.
+// provider of its own, in the order they were saved. Each keeps what the
+// user set on the provider, as p has it from All: its queue, limits,
+// routing and models (withPicks). A Claude or Codex account is p with
+// another sign-in, and had them always; one a sign-in of its own makes
+// afresh had none, and a second WorkBuddy AI account queued 62s with the
+// wait set to 1s (#1899).
 func (p Provider) AlsoOn() []Provider {
+	out := p.alsoOn()
+	for i, q := range out {
+		out[i] = withPicks(q, p)
+	}
+	return out
+}
+
+// alsoOn is AlsoOn as each sign-in makes its accounts, without the
+// provider's settings.
+func (p Provider) alsoOn() []Provider {
 	if p.IsPlugin() {
 		return pluginAlsoOn(*p.Account.plugin)
-	}
-	if p.Account != nil && p.Account.Agent == "grok" && p.Account.token == nil {
-		return grokAlsoOn(p)
 	}
 	if p.Account != nil && p.Account.Agent == "copilot" {
 		return copilotAlsoOn()
 	}
-	if p.Account != nil && p.Account.Agent == "zcode" {
-		return zcodeAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "kiro" {
-		return kiroAlsoOn(p)
-	}
-	if p.Account != nil && p.Account.Agent == "devin" {
-		return devinAlsoOn()
-	}
-	if p.Account != nil && wbSiteOf(p.Account.Agent) != nil {
-		return workBuddyAlsoOn(wbSiteOf(p.Account.Agent))
-	}
-	if p.Account != nil && p.Account.Agent == CommandCodePlanID {
-		return commandCodeAlsoOn()
-	}
-	if p.Account != nil && (p.Account.Agent == "qoder" || p.Account.Agent == QoderCNID) {
-		return qoderAlsoOn(p.Account.Agent)
-	}
-	if p.Account != nil && p.Account.Agent == "zed" {
-		return zedAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "factory" {
-		return factoryAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == MiMoID {
-		return mimoAlsoOn()
+	if p.Account != nil && p.Account.Agent == ChatGPTAPIID {
+		return siwcAlsoOn()
 	}
 	if p.Account != nil && (p.Account.Agent == "gemini" || p.Account.Agent == "antigravity") {
 		return googleAlsoOn(p.Account.Agent)
@@ -197,9 +173,19 @@ func (p Provider) AlsoOn() []Provider {
 
 // Token is the access token of a saved account in use beside the agent's
 // own — for a Claude account, the config directory Claude Code runs on it
-// in; ok is false for the agent's own, which the agent signs itself.
+// in; ok is false for the agent's own, which the agent signs itself. A
+// Claude account that can't be used, Anthropic having refused its sign-in,
+// is an error, whichever it is (claude_auth.go).
 func (a *Account) Token(ctx context.Context) (tok string, ok bool, err error) {
-	if a == nil || a.token == nil {
+	if a == nil {
+		return "", false, nil
+	}
+	if a.token == nil {
+		if a.Agent == "claude" {
+			if why := claudeOwnRefused(a.User); why != "" {
+				return "", false, errors.New(why)
+			}
+		}
 		return "", false, nil
 	}
 	tok, err = a.token(ctx)

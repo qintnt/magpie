@@ -33,6 +33,10 @@ type fakeGoogle struct {
 	flags     string // listExperiments' reply
 	models    string // fetchAvailableModels' reply
 	summary   string // retrieveUserQuotaSummary's reply
+	// fetchAvailableModels' status and reply for the body asked, in place
+	// of models
+	modelsFor func(body map[string]any) (int, string)
+	fetches   []map[string]any
 	exps      []map[string]any
 	heads     map[string]http.Header
 }
@@ -66,6 +70,11 @@ func (f *fakeGoogle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, f.quota)
 	case strings.HasSuffix(r.URL.Path, ":retrieveUserQuotaSummary") && f.summary != "":
 		io.WriteString(w, f.summary)
+	case strings.HasSuffix(r.URL.Path, ":fetchAvailableModels") && f.modelsFor != nil:
+		f.fetches = append(f.fetches, body)
+		code, reply := f.modelsFor(body)
+		w.WriteHeader(code)
+		io.WriteString(w, reply)
 	case strings.HasSuffix(r.URL.Path, ":fetchAvailableModels") && f.models != "":
 		io.WriteString(w, f.models)
 	case strings.HasSuffix(r.URL.Path, ":listExperiments") && f.flags != "":
@@ -531,6 +540,63 @@ func TestAntigravityQuotaPools(t *testing.T) {
 	if len(q.Windows) != 4 || q.Windows[0].Pool != "" || len(PooledWindows(q.Windows)) != 4 {
 		t.Errorf("without a summary: %+v", q.Windows)
 	}
+
+	// a summary with a group's week and not its 5 hours (#745): the
+	// group's models aren't put in it, so their 5 hours stay beside its week
+	f.mu.Lock()
+	f.summary = `{"groups":[
+		{"displayName":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[
+			{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.75,"resetTime":"2099-01-07T00:00:00Z"},
+			{"bucketId":"gemini-5h","window":"5h","remainingFraction":1,"disabled":true}]}]}`
+	f.mu.Unlock()
+	q = googleLogins("antigravity")[0].acct.quota(context.Background(), "")
+	got = nil
+	for _, w := range PooledWindows(q.Windows) {
+		got = append(got, w.Name+"|"+w.Pool)
+	}
+	if strings.Join(got, ",") != "Claude Opus 4.6 (Thinking)|,Gemini 3 Flash|,Gemini 3.1 Pro (High)|,GPT-OSS 120B (Medium)|,Gemini · 7 days|Gemini" {
+		t.Errorf("week alone: pooled = %v", got)
+	}
+}
+
+// #745 (werldl517-cyber): a pool's windows stand in for its models' only
+// for the spans the pool has; with only its week, a model's 5 hours stay.
+func TestPooledWindowsPartialAggregateKeepsModelFallback(t *testing.T) {
+	ws := []QuotaWindow{
+		{Name: "Gemini 3 Flash", Model: "gemini-3-flash", Pool: "Gemini", Span: 5 * time.Hour, Used: 40},
+		{Name: "7 days", Pool: "Gemini", Span: 7 * 24 * time.Hour, Aside: true, Used: 80},
+	}
+	got := PooledWindows(ws)
+	for _, w := range got {
+		t.Logf("name=%q model=%q pool=%q span=%s used=%.0f aside=%v", w.Name, w.Model, w.Pool, w.Span, w.Used, w.Aside)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d windows, want the 5h model fallback plus the 7d pool aggregate", len(got))
+	}
+
+	model := func(id string, span time.Duration) QuotaWindow {
+		return QuotaWindow{Name: id, Model: id, Pool: "Gemini", Span: span}
+	}
+	five := QuotaWindow{Name: "5 hours", Pool: "Gemini", Span: 5 * time.Hour, Aside: true}
+	week := QuotaWindow{Name: "7 days", Pool: "Gemini", Span: 7 * 24 * time.Hour, Aside: true}
+	for _, c := range []struct {
+		name string
+		ws   []QuotaWindow
+		want string
+	}{
+		{"5 hours and week", []QuotaWindow{model("a", 0), model("b", 0), week, five}, "Gemini · 7 days,Gemini · 5 hours"},
+		{"week alone", []QuotaWindow{model("a", 0), model("b", 5*time.Hour), week}, "a,b,Gemini · 7 days"},
+		{"5 hours alone", []QuotaWindow{model("a", 0), model("b", 0), five}, "Gemini · 5 hours"},
+		{"no pool windows", []QuotaWindow{model("a", 0), model("b", 0)}, "a,b"},
+	} {
+		var names []string
+		for _, w := range PooledWindows(c.ws) {
+			names = append(names, w.Name)
+		}
+		if strings.Join(names, ",") != c.want {
+			t.Errorf("%s: %v, want %s", c.name, names, c.want)
+		}
+	}
 }
 
 // Antigravity's list is taken as Antigravity gives it (0000FF on Discord:
@@ -583,5 +649,175 @@ func TestAntigravityModelsAsItListsThem(t *testing.T) {
 	}
 	if w := "gemini-3.8-flash|1048576 claude-opus-5-5|250000 claude-opus-4-6-thinking|250000 text-only-x|131072 gemini-3.1-flash-lite|1048576"; strings.Join(offered, " ") != w {
 		t.Errorf("offered %v\nwant %s", offered, w)
+	}
+}
+
+// Antigravity lists gemini-2.5-flash and gemini-2.5-flash-lite under the
+// name of the model it moved their users to, tagged with that model's id,
+// beside that model itself (kchen0x's fetchAvailableModels, #1918); each id
+// is still answered by its own model. Each is named for its own id, in the
+// list and in Usage's windows, so no two read the same; a level tagged
+// with its own family keeps the name it was given.
+func TestAntigravityRetiredModelNamedForItself(t *testing.T) {
+	f := &fakeGoogle{
+		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
+		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
+		models: `{"models":{
+  "gemini-2.5-flash": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH",
+    "maxTokens": 1048576,
+    "maxOutputTokens": 65535,
+    "supportsImages": true
+  },
+  "gemini-2.5-flash-lite": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE",
+    "maxTokens": 1048576,
+    "maxOutputTokens": 65535,
+    "supportsImages": true
+  },
+  "gemini-2.5-flash-thinking": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING"
+  },
+  "gemini-3.5-flash-lite": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_PLACEHOLDER_M198",
+    "maxTokens": 1048576,
+    "maxOutputTokens": 65535,
+    "supportsImages": true
+  },
+  "gemini-3.7-flash": {"displayName": "Gemini 3.7 Flash", "tagDescription": "gemini-3.7-flash", "quotaInfo": {"remainingFraction": 1}},
+  "gemini-3.7-flash-low": {"displayName": "Gemini 3.7 Flash", "tagDescription": "gemini-3.7-flash", "quotaInfo": {"remainingFraction": 1}}
+}}`,
+	}
+	googleSandbox(t, f)
+	auth := googleAuth{AccessToken: "tok", RefreshToken: "rt-ag", Expiry: time.Now().Add(time.Hour).UnixMilli()}
+	if err := addGoogleLogin("antigravity", "ag@example.com", "", auth); err != nil {
+		t.Fatal(err)
+	}
+	acct := googleLogins("antigravity")[0].acct
+	ms, err := acct.models(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, m := range collapseAntigravityModels(catalog.Decorate(ms, nil)) {
+		names[m.ID] = m.Name
+	}
+	if names["gemini-3.5-flash-lite"] != "Gemini 3.5 Flash Lite" {
+		t.Errorf("gemini-3.5-flash-lite is named %q", names["gemini-3.5-flash-lite"])
+	}
+	for _, id := range []string{"gemini-2.5-flash", "gemini-2.5-flash-lite"} {
+		if n := names[id]; n == "" || strings.Contains(n, "3.5") {
+			t.Errorf("%s is named %q, not for itself", id, n)
+		}
+	}
+	if names["gemini-2.5-flash"] == names["gemini-2.5-flash-lite"] {
+		t.Errorf("two models read the same: %v", names)
+	}
+	for _, m := range ms {
+		if strings.HasPrefix(m.ID, "gemini-3.7-flash") && m.Name != "Gemini 3.7 Flash" {
+			t.Errorf("%s, a level of the model its tag names, is named %q", m.ID, m.Name)
+		}
+	}
+	for _, w := range acct.quota(context.Background(), "").Windows {
+		if strings.HasPrefix(w.Model, "gemini-2.5") && strings.Contains(w.Name, "3.5") {
+			t.Errorf("Usage's window for %s is named %q", w.Model, w.Name)
+		}
+	}
+}
+
+// Antigravity's list as it came on 2026-10-20 (testdata, fetchAvailableModels
+// on a free-tier account, MIME types and experiments left out): the
+// retired gemini-2.5-flash and gemini-2.5-flash-lite are still "Gemini 3.5
+// Flash Lite", but with no tagDescription, so naming them by their tag
+// left two chips of that name in 新v学员's editor (Discord, 10-20). Each
+// is named for its own id with gemini-3.5-flash-lite in the list, and
+// without it (an account Antigravity doesn't give it), where only their
+// enums, MODEL_GOOGLE_GEMINI_2_5_FLASH…, say what they are, and with their
+// enums placeholders, where only gemini-3.5-flash-lite's id spelling the
+// name does; no two models read the same, and the names Antigravity gives
+// the rest stay.
+func TestAntigravityRetiredModelNamedWithoutTag(t *testing.T) {
+	raw, err := os.ReadFile("testdata/antigravity-models-2026-10-20.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name              string
+		withLite, noEnums bool
+	}{{"as listed", true, false}, {"no gemini-3.5-flash-lite", false, false}, {"placeholder enums", true, true}} {
+		withLite := c.withLite
+		t.Run(c.name, func(t *testing.T) {
+			var list map[string]any
+			if err := json.Unmarshal(raw, &list); err != nil {
+				t.Fatal(err)
+			}
+			models := list["models"].(map[string]any)
+			if !withLite {
+				delete(models, "gemini-3.5-flash-lite")
+			}
+			if c.noEnums {
+				for _, id := range []string{"gemini-2.5-flash", "gemini-2.5-flash-lite"} {
+					models[id].(map[string]any)["model"] = "MODEL_PLACEHOLDER_M" + id
+				}
+			}
+			body, _ := json.Marshal(list)
+			f := &fakeGoogle{
+				load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
+				onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
+				models:  string(body),
+			}
+			googleSandbox(t, f)
+			auth := googleAuth{AccessToken: "tok", RefreshToken: "rt-ag", Expiry: time.Now().Add(time.Hour).UnixMilli()}
+			if err := addGoogleLogin("antigravity", "ag@example.com", "", auth); err != nil {
+				t.Fatal(err)
+			}
+			acct := googleLogins("antigravity")[0].acct
+			ms, err := acct.models(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			names, seen := map[string]string{}, map[string]string{}
+			for _, m := range collapseAntigravityModels(catalog.Decorate(ms, nil)) {
+				names[m.ID] = m.Name
+				if other, ok := seen[m.Name]; ok {
+					t.Errorf("%s and %s both read %q", other, m.ID, m.Name)
+				}
+				seen[m.Name] = m.ID
+			}
+			for _, id := range []string{"gemini-2.5-flash", "gemini-2.5-flash-lite"} {
+				if n := names[id]; n == "" || strings.Contains(n, "3.5") {
+					t.Errorf("%s is named %q, not for itself", id, n)
+				}
+			}
+			want := map[string]string{
+				"gemini-3-flash":         "Gemini 3 Flash",
+				"gemini-3-flash-agent":   "Gemini 3.5 Flash (High)",
+				"gemini-3.1-flash-lite":  "Gemini 3.1 Flash Lite",
+				"gemini-3.1-flash-image": "Gemini 3.1 Flash Image",
+				"gpt-oss-120b-medium":    "GPT-OSS 120B (Medium)",
+				"gemini-3.8-flash":       "Gemini 3.8 Flash",
+			}
+			if withLite {
+				want["gemini-3.5-flash-lite"] = "Gemini 3.5 Flash Lite"
+			}
+			for id, w := range want {
+				if names[id] != w {
+					t.Errorf("%s is named %q, want %q", id, names[id], w)
+				}
+			}
+			for _, w := range acct.quota(context.Background(), "").Windows {
+				if strings.HasPrefix(w.Model, "gemini-2.5") && strings.Contains(w.Name, "3.5") {
+					t.Errorf("Usage's window for %s is named %q", w.Model, w.Name)
+				}
+			}
+		})
 	}
 }

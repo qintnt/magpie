@@ -270,3 +270,36 @@ func TestLedgerKeepsLocalAccountsSeparateFromGatewayProviders(t *testing.T) {
 		t.Fatalf("local identity was lost or guessed: %+v", rows)
 	}
 }
+
+// An OpenCode reply names only the model it was sent to, and the effort
+// picked for its prompt (#680): the row's requested model and effort, not a
+// served model the file never saw.
+func TestOpenCodeSessionCallIsWhatItAskedFor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	logs := []sessions.Call{{Time: time.Now(), Agent: "opencode", Model: "space-bunny-free", Upstream: "opencode", Effort: "high",
+		Tokens: sessions.Tokens{Input: 10, Output: 2}}}
+	rows, _, _, _ := ledgerWith(time.Time{}, Filter{}, nil, logs)
+	if len(rows) != 1 {
+		t.Fatalf("rows %+v", rows)
+	}
+	if r := rows[0]; r.Requested != "space-bunny-free" || r.Model != "space-bunny-free" || r.Served != "" || r.Effort != "high" {
+		t.Fatalf("an OpenCode call: requested %q model %q served %q effort %q", r.Requested, r.Model, r.Served, r.Effort)
+	}
+}
+
+// A Claude Code call outside every desktop root costs nothing to place:
+// a started magpie's first Requests read asks this of every call twice,
+// and the path arithmetic it skipped was a fifth of what that read
+// allocated.
+func TestDesktopIdentityOfCLICallAllocatesNothing(t *testing.T) {
+	r := &sessionResolver{roots: []string{"/Users/u/Library/Application Support/Claude", "/Users/u/Library/Application Support/Claude-3p"}}
+	call := sessions.Call{Agent: "claude", Session: "s", File: "/Users/u/.claude/projects/-Users-u-src-app/0b9c2f6e-1d3a-4e8f-9a7b-5c6d7e8f9a0b.jsonl"}
+	if n := testing.AllocsPerRun(100, func() { r.desktopIdentity(call) }); n != 0 {
+		t.Fatalf("a CLI call's desktop identity allocated %v times", n)
+	}
+}

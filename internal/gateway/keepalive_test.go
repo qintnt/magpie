@@ -23,15 +23,18 @@ func keepFast(t *testing.T, gap, every, longest time.Duration) {
 }
 
 // TestTranslatedStreamKeepsClientAlive: a provider that says "progress",
-// then only ": keepalive" every 20ms for half a second, then finishes,
-// translated for a client whose idle timeout is 150ms (#436, congee949's
-// repro). The client must hear something it counts all along: Codex's
+// then only ": keepalive" every 20ms for 1.5s, then finishes, translated
+// for a client whose idle timeout is 500ms (#436, congee949's repro).
+// Without magpie's keepalives the client hears nothing for three of its
+// timeouts; 500ms, not 150ms, is room for a loaded machine's scheduler
+// (#2169, #2711, #2737). The client must hear something it counts all along: Codex's
 // timeout counts events, never a comment, so a Responses or Anthropic
 // client is kept alive with events, a Chat one with comments.
 func TestTranslatedStreamKeepsClientAlive(t *testing.T) {
 	keepFast(t, 10*time.Millisecond, keepaliveEvery, keepaliveLongest)
+	const quietFor, idleFor = 1500 * time.Millisecond, 500 * time.Millisecond
 	for _, c := range []struct {
-		name, path, body, done, ping string
+		name, path, body, done, ping string // done: the reply's last event
 		upChat                       bool
 		comments                     bool // the client counts a comment as life
 	}{
@@ -40,7 +43,7 @@ func TestTranslatedStreamKeepsClientAlive(t *testing.T) {
 		{"chat_to_anthropic", "/v1/messages", `{"model":"fake/m1","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`,
 			`"type":"message_stop"`, `"type":"ping"`, true, false},
 		{"responses_to_chat", "/v1/chat/completions", `{"model":"fake/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
-			`"finish_reason":"stop"`, ": keepalive", false, true},
+			"data: [DONE]", ": keepalive", false, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			fresh(t)
@@ -58,7 +61,7 @@ func TestTranslatedStreamKeepsClientAlive(t *testing.T) {
 				f.Flush()
 				tick := time.NewTicker(20 * time.Millisecond)
 				defer tick.Stop()
-				end := time.NewTimer(500 * time.Millisecond)
+				end := time.NewTimer(quietFor)
 				defer end.Stop()
 				for {
 					select {
@@ -110,9 +113,21 @@ func TestTranslatedStreamKeepsClientAlive(t *testing.T) {
 					lines <- sc.Text()
 				}
 			}()
-			idle := time.NewTimer(150 * time.Millisecond)
+			idle := time.NewTimer(idleFor)
 			defer idle.Stop()
-			timedOut, completed, pings := false, false, 0
+			// the client's idle timeout, until it has the whole reply. What
+			// the gateway does after that before the stream closes (the
+			// usage ledger, affinity, served) is no wait a client's idle
+			// timeout counts: Codex hangs up on response.completed, and the
+			// clients that read on to the close wait minutes, not idleFor.
+			// Then the stream closes within closeAfterLast, or the test
+			// fails rather than hangs.
+			const closeAfterLast = 5 * time.Second
+			wait := idle.C
+			timedOut, completed, unclosed, pings := false, false, false, 0
+			// openai-go v2 (Crush) reads every blank line as an event and
+			// fails on one with no data: "unexpected end of JSON input"
+			data, empty := false, 0
 		read:
 			for {
 				select {
@@ -123,22 +138,36 @@ func TestTranslatedStreamKeepsClientAlive(t *testing.T) {
 					if strings.Contains(line, c.ping) {
 						pings++
 					}
-					if strings.Contains(line, c.done) {
-						completed = true
+					if line == "" {
+						if !data {
+							empty++
+						}
+						data = false
+					} else if strings.HasPrefix(line, "data:") {
+						data = true
+					}
+					if strings.Contains(line, c.done) && !completed {
+						completed, wait = true, time.After(closeAfterLast)
 					}
 					// what the client's idle timeout counts
 					if strings.HasPrefix(line, "data:") || (c.comments && strings.HasPrefix(line, ":")) {
-						idle.Reset(150 * time.Millisecond)
+						idle.Reset(idleFor)
 					}
-				case <-idle.C:
-					timedOut = true
+				case <-wait:
+					timedOut, unclosed = !completed, completed
 					break read
 				}
 			}
 			cancel()
+			if unclosed {
+				t.Fatalf("the stream didn't close within %v of its last event", closeAfterLast)
+			}
 			t.Logf("upstream_keepalives=%d downstream_keepalives=%d idle_timeout=%v completed=%v", upPings.Load(), pings, timedOut, completed)
 			if timedOut || !completed || pings < 3 {
 				t.Fatal("the client wasn't kept alive while the provider was")
+			}
+			if empty > 0 {
+				t.Fatalf("%d events with no data", empty)
 			}
 		})
 	}
@@ -167,7 +196,10 @@ func TestTranslatedSilenceStillTimesOut(t *testing.T) {
 	}
 	server := httptest.NewServer(New().Handler())
 	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	// The client's idle timeout is over the body: it starts once the
+	// headers are in, so that a loaded machine's slow first byte isn't
+	// taken for it (#2248). 400ms is 40 keepalive gaps.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "POST", server.URL+"/v1/responses", strings.NewReader(`{"model":"fake/m1","stream":true,"input":"hi"}`))
 	res, err := http.DefaultClient.Do(req)
@@ -175,6 +207,8 @@ func TestTranslatedSilenceStillTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
+	idle := time.AfterFunc(400*time.Millisecond, cancel)
+	defer idle.Stop()
 	b, _ := io.ReadAll(res.Body)
 	if n := strings.Count(string(b), `"type":"response.in_progress"`); n > 1 {
 		t.Fatalf("a silent provider was covered for: %d in_progress events\n%s", n, b)
@@ -199,7 +233,7 @@ func TestRelayKeepsClientAlive(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := &Request{Model: "m1", Stream: true}
 	r := httptest.NewRequest("POST", "/v1/messages", nil)
-	code, failed := relay(rec, r, provider.Anthropic, "Bridge", req, events, &Usage{}, func() {}, func(string, string, bool) {})
+	code, failed := relay(rec, r, provider.Anthropic, "Bridge", req, events, &Usage{}, func() {}, nil, func(string, string, bool) {})
 	if code != 200 || failed != "" {
 		t.Fatalf("relay: %d %q", code, failed)
 	}

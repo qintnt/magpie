@@ -19,29 +19,96 @@ var trayZh = map[string]string{
 	"Restart Now to Update (%d in flight)": "立即重启以更新（%d 个进行中）",
 }
 
+// trayZhTW is the tray menu in Traditional Chinese, with Taiwan's words.
+var trayZhTW = map[string]string{
+	"Open magpie":                          "開啟 magpie",
+	"Version %s":                           "版本 %s",
+	"Restart to Update":                    "重新啟動以更新",
+	"Restart to Update to %s":              "重新啟動以更新到 %s",
+	"Quit magpie":                          "結束 magpie",
+	"Restart Now to Update":                "立即重新啟動以更新",
+	"Restart Now to Update (%d in flight)": "立即重新啟動以更新（%d 個進行中）",
+}
+
+// trayJa is the tray menu in Japanese.
+var trayJa = map[string]string{
+	"Open magpie":                          "magpie を開く",
+	"Version %s":                           "バージョン %s",
+	"Restart to Update":                    "再起動してアップデート",
+	"Restart to Update to %s":              "再起動して %s にアップデート",
+	"Quit magpie":                          "magpie を終了",
+	"Restart Now to Update":                "今すぐ再起動してアップデート",
+	"Restart Now to Update (%d in flight)": "今すぐ再起動してアップデート（%d 件処理中）",
+}
+
+// trayDe is the tray menu in German.
+var trayDe = map[string]string{
+	"Open magpie":                          "magpie öffnen",
+	"Version %s":                           "Version %s",
+	"Restart to Update":                    "Zum Aktualisieren neu starten",
+	"Restart to Update to %s":              "Zum Aktualisieren auf %s neu starten",
+	"Quit magpie":                          "magpie beenden",
+	"Restart Now to Update":                "Jetzt neu starten und aktualisieren",
+	"Restart Now to Update (%d in flight)": "Jetzt neu starten und aktualisieren (%d laufend)",
+}
+
+// trayWords are the tray menu's translations by language.
+var trayWords = map[string]map[string]string{"zh": trayZh, "zh-TW": trayZhTW, "ja": trayJa, "de": trayDe}
+
 // onLang relabels the tray menu when the Settings page changes the
 // language; set by the process that has the tray.
 var onLang func()
 
 // trayLang is the language the tray menu is in, as the page picks its own:
-// the setting, or with "system" (or none) the system's, Chinese for any zh.
+// the setting, or with "system" (or none) the system's: Traditional Chinese
+// for Taiwan, Hong Kong, Macau and any zh-Hant (zh_TW.UTF-8, zh-Hant-TW),
+// Simplified for any other zh, Japanese for any ja, German for any de.
 func trayLang(pref string, system func() string) string {
 	switch pref {
-	case "en", "zh":
+	case "en", "zh", "zh-TW", "ja", "de":
 		return pref
 	}
-	if strings.HasPrefix(strings.ToLower(system()), "zh") {
+	switch sys := strings.ReplaceAll(strings.ToLower(system()), "_", "-"); {
+	case zhTraditional(sys):
+		return "zh-TW"
+	case strings.HasPrefix(sys, "zh"):
 		return "zh"
+	case strings.HasPrefix(sys, "ja"):
+		return "ja"
+	case strings.HasPrefix(sys, "de"):
+		return "de"
 	}
 	return "en"
 }
 
+// zhTraditional says a lowercased, dashed system tag is Traditional
+// Chinese, as the page's sysLocale does.
+func zhTraditional(sys string) bool {
+	for _, p := range []string{"zh-tw", "zh-hk", "zh-mo", "zh-hant"} {
+		if sys == p || strings.HasPrefix(sys, p+"-") || strings.HasPrefix(sys, p+".") || strings.HasPrefix(sys, p+"@") {
+			return true
+		}
+	}
+	return false
+}
+
+// notesLang is the language release notes are asked in for lang: there are
+// no German ones, so German asks for the English, and Traditional Chinese
+// asks for the Chinese ones.
+func notesLang(lang string) string {
+	switch lang {
+	case "de":
+		return "en"
+	case "zh-TW":
+		return "zh"
+	}
+	return lang
+}
+
 // trayText is a menu line in the language, English where it has none.
 func trayText(lang, key string, args ...any) string {
-	if lang == "zh" {
-		if s, ok := trayZh[key]; ok {
-			key = s
-		}
+	if s, ok := trayWords[lang][key]; ok {
+		key = s
 	}
 	if len(args) == 0 {
 		return key

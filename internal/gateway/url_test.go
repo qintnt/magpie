@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 func TestPublicURL(t *testing.T) {
@@ -127,12 +128,12 @@ func TestPublicURLWarningOnce(t *testing.T) {
 	}
 }
 
-// OpenToAnyone: the gateway listens beyond loopback (MAGPIE_ADDR) and no key
-// is shared, so anyone who reaches it is let in — the console says so, as
+// OnNetwork: MAGPIE_ADDR puts the gateway beyond loopback, shared or not,
+// so callers from elsewhere need a gateway key — the console says so, as
 // keyNote does.
-func TestOpenToAnyone(t *testing.T) {
+func TestOnNetwork(t *testing.T) {
 	h := t.TempDir()
-	t.Setenv("HOME", h)
+	testenv.SetHome(t, h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(h, ".local"))
@@ -143,16 +144,19 @@ func TestOpenToAnyone(t *testing.T) {
 	}{
 		{"127.0.0.1:3425", false, false},
 		{"127.0.0.1:3425", true, false},
+		{"localhost:3425", false, false},
+		{"[::1]:3425", false, false},
 		{"0.0.0.0:3425", false, true},
-		{"0.0.0.0:3425", true, false},
+		{"0.0.0.0:3425", true, true},
+		{":3425", false, true},
 		{"10.0.0.5:3425", false, true},
-		{"10.0.0.5:3425", true, false},
+		{"10.0.0.5:3425", true, true},
 	} {
 		t.Setenv("MAGPIE_ADDR", c.addr)
 		if err := settings.Save(settings.Settings{LAN: c.lan}); err != nil {
 			t.Fatal(err)
 		}
-		if got := OpenToAnyone(); got != c.want {
+		if got := OnNetwork(); got != c.want {
 			t.Errorf("%s shared=%v: %v, want %v", c.addr, c.lan, got, c.want)
 		}
 	}

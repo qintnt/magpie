@@ -24,7 +24,7 @@ async function serve(route) {
   if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
   if (url.pathname === "/api/state") return json({
     agents: [{
-      id: "codex", name: "Codex", path: "/test/config.toml", icon: "codex-color",
+      id: "codex", name: "Codex", path: "/test/config.toml", icon: "codex-color", wired: true,
       fields: [{ key: "model", label: "model", value: "magpie/openai/gpt-5.5", options: [{ value: "magpie/openai/gpt-5.5", label: "GPT-5.5", ref: "openai/gpt-5.5" }] }],
       models: { shown: 3, listed: 3 },
     }],
@@ -52,7 +52,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     await page.route("**/*", serve);
     t.after(() => browser.close());
     await page.goto("http://magpie.test/");
-    const entry = page.locator('.row.agent[data-id="codex"] .ag-models');
+    // the list opens from Pick in the connected row, opened
+    await page.locator('.row.agent[data-id="codex"] .ag-link').click();
+    // "elsewhere" is the page's lead line: the opened row holds Codex's own
+    // settings and its Disconnect button, so a fixed point could hit one
+    const lead = await page.locator("#agentsLead").boundingBox();
+    const away = () => page.mouse.click(lead.x + lead.width / 2, lead.y + lead.height / 2);
+    const entry = page.locator('.row.agent[data-id="codex"] .ag-exp .ag-chips .ag-quiet');
     await entry.waitFor();
     const boxes = () => page.locator(".am-pop:not(.leaving)").count();
 
@@ -68,13 +74,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     await entry.click();
     await page.waitForTimeout(1000);
     assert.equal(await boxes(), 1, "one box at most");
-    await page.mouse.click(900, 650);
+    await away();
     await page.waitForTimeout(500);
     assert.equal(await boxes(), 0, "a click elsewhere closes it");
 
     // a click elsewhere while it loads: it doesn't come up
     await entry.click();
-    await page.mouse.click(900, 650);
+    await away();
     await page.waitForTimeout(1000);
     assert.equal(await boxes(), 0, "a click away while it loads takes it back");
 

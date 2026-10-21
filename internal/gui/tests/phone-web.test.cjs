@@ -53,6 +53,37 @@ const box = (page, s) => page.locator(s).first().boundingBox();
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   const phone = { ...devices["iPhone 13"] };
   if (engine === "chromium") delete phone.defaultBrowserType;
+  test(`${engine}: phone layout is ready while app.js is still downloading`, async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    t.after(() => browser.close());
+    const context = await browser.newContext({ ...phone, reducedMotion: "reduce" });
+    const page = await context.newPage();
+    let release;
+    const pending = new Promise((resolve) => { release = resolve; });
+    t.after(() => release());
+    const handle = serve(true);
+    await page.route("**/*", async (route) => {
+      if (new URL(route.request().url()).pathname === "/app.js") await pending;
+      await handle(route);
+    });
+    const loaded = page.goto("http://magpie.test/");
+    try {
+      await page.waitForSelector("#nav", { state: "visible" });
+      const [nav, actions] = [await box(page, "#nav"), await box(page, ".top .actions")];
+      assert.ok(nav.y >= actions.y + actions.height - 1, "tabs already have their own row before app.js runs");
+      assert.equal(await page.locator("#open").isVisible(), false, "the window button never flashes");
+      assert.equal(await page.locator("#winclose").isVisible(), false, "the close button never flashes");
+      assert.match(await page.locator('meta[name="viewport"]').getAttribute("content"), /maximum-scale=1/, "the existing iOS viewport policy applies before app.js runs");
+      release();
+      await loaded;
+      const readyNav = await box(page, "#nav");
+      assert.ok(Math.abs(readyNav.y - nav.y) <= 1, "the navigation stays in its initial row after startup");
+    } finally {
+      release();
+      await loaded;
+    }
+  });
+
   test(`${engine}: magpie web on a phone`, async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
@@ -118,7 +149,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   test(`${engine}: a desktop browser and the window keep one row`, async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const [web, width] of [[true, 1100], [false, 560]]) {
+    // a desktop browser narrower than the sidebar's width: its tabs in the header
+    for (const [web, width] of [[true, 1000], [false, 560]]) {
       const page = await open(browser, { viewport: { width, height: 700 } }, web, "agents");
       const [top, nav] = [await box(page, ".top"), await box(page, "#nav")];
       assert.ok(nav.y + nav.height <= top.y + top.height + 1, `${web ? "web" : "window"} at ${width}: the tabs in the header's row`);

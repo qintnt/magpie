@@ -6,12 +6,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/services/notifications"
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -42,9 +45,13 @@ func (n *notifier) start() error {
 			log.Println("notifications:", err)
 			return
 		}
-		// a click on one opens the Usage page
-		ns.OnNotificationResponse(func(notifications.NotificationResult) {
-			n.h.whenReady(func() { application.InvokeAsync(func() { n.h.ShowMain("usage") }) })
+		if runtime.GOOS == "linux" {
+			_ = ns.RegisterNotificationCategory(clickCategory)
+		}
+		ns.OnNotificationResponse(func(r notifications.NotificationResult) {
+			if opensUsage(runtime.GOOS, r.Response) {
+				n.h.whenReady(func() { application.InvokeAsync(func() { n.h.ShowMain("usage") }) })
+			}
 		})
 		n.ns = ns
 	})
@@ -84,14 +91,58 @@ func (n *notifier) problem() string {
 	return ""
 }
 
-func (n *notifier) send(title, body string) {
+// turnNotice is the id a turn's end is notified under, an alert's
+// "magpie-alert-"
+const turnNotice = "magpie-turn-"
+
+func (n *notifier) send(title, body string) { n.sendAs("magpie-alert-", title, body) }
+
+func (n *notifier) sendAs(kind, title, body string) {
 	if !n.allowed() {
 		return
 	}
-	id := fmt.Sprintf("magpie-alert-%d", time.Now().UnixNano())
-	if err := n.ns.SendNotification(notifications.NotificationOptions{ID: id, Title: title, Body: body}); err != nil {
+	o := notice(runtime.GOOS, fmt.Sprintf("%s%d", kind, time.Now().UnixNano()), title, body)
+	send := n.ns.SendNotification
+	if o.CategoryID != "" {
+		send = n.ns.SendNotificationWithActions
+	}
+	if err := send(o); err != nil {
 		log.Println("notifications:", err)
 	}
+}
+
+// linuxClick is the freedesktop action key a click on a notification's body
+// invokes, and clickCategory gives an action that id. Wails reports an
+// action of a category under its own id, and maps "default" to
+// DefaultActionIdentifier only without one; it reports a Linux
+// notification closed by the user, with its × or cleared from the list, as
+// DefaultActionIdentifier too. Under clickCategory the two come back apart.
+const linuxClick = "default"
+
+var clickCategory = notifications.NotificationCategory{
+	ID:      "magpie-click",
+	Actions: []notifications.NotificationAction{{ID: linuxClick, Title: "Open"}},
+}
+
+// notice is the notification sent as id: on Linux under clickCategory.
+func notice(goos, id, title, body string) notifications.NotificationOptions {
+	o := notifications.NotificationOptions{ID: id, Title: title, Body: body}
+	if goos == "linux" {
+		o.CategoryID = clickCategory.ID
+	}
+	return o
+}
+
+// opensUsage says whether a response to a notification opens the Usage
+// page: a click on an alert does. On a turn's end, where the user goes is
+// their agent, not magpie. On Linux only a click (linuxClick) is one: an
+// alert dismissed there opened the main window, maximised if it was left
+// so, over the desktop with the focus (#2513).
+func opensUsage(goos string, r notifications.NotificationResponse) bool {
+	if strings.HasPrefix(r.ID, turnNotice) {
+		return false
+	}
+	return goos != "linux" || r.ActionIdentifier == linuxClick
 }
 
 // watchAlerts tells the user, with a notification, of a window used past
@@ -112,8 +163,13 @@ func (h *host) watchAlerts() {
 	go func() {
 		<-h.ready
 		// set before this run: asked now, so Settings can say if it was refused
-		if s := settings.Load(); s.UsageAlert > 0 || s.BalanceAlert > 0 {
+		if s := settings.Load(); s.UsageAlert > 0 || s.BalanceAlert > 0 || s.ResetReminder > 0 || s.TurnDoneAlert > 0 {
 			go n.allowed()
+		}
+		// an agent's turn done, past the length set (itieniu on X)
+		gateway.TurnDone = func(t gateway.TurnEnd) {
+			title, body := turnDoneText(trayLang(settings.Load().Lang, systemLang), agentName(t.Agent), t)
+			n.sendAs(turnNotice, title, body)
 		}
 		provider.WatchQuotas(context.Background(), wake, func(a provider.QuotaAlert) {
 			s := settings.Load()

@@ -17,6 +17,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
@@ -71,7 +72,7 @@ const L = {
   },
 };
 
-const LISTS = { codex: "codexWarmList", claude: "claudeWarmList", wb: "wbList" };
+const LISTS = { codex: "codexWarmList", claude: "claudeWarmList", wb: "wbList", trae: "traeList" };
 const view = (page) => page.locator("#view-settings").evaluate((v) => v.scrollTop);
 // the tab picked and the pane shown, both as the page says them
 async function shown(page) {
@@ -108,7 +109,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", server(lang, posts, over));
       const go = async () => {
         await page.locator("#prefs").click();
-        await page.locator("#setTab-usage").click();
+        await openPart(page, "usage");
         await page.locator("#warmSegs .opt").first().waitFor({ state: "attached" });
       };
       await page.goto("http://magpie.test/");
@@ -300,6 +301,27 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.setViewportSize({ width: 900, height: 1000 });
         await page.locator("#warmTab-claude").click();
         assert.deepEqual((await shown(page)).panes, ["claude"]);
+        assert.deepEqual(errors, []);
+      });
+
+      await t.test(lang + ": a Trae CN account signed in (#694)", async () => {
+        // Trae CN's tab beside the others while one is signed in, with its
+        // own Daily check-in, saved as traeCheckin; WorkBuddy's left alone
+        const posts = [];
+        const { page, errors } = await open(lang, posts, {
+          trae: true,
+          traeCheckins: [{ user: "Ann", by: "trae", day: today, at: new Date().toISOString(), outcome: "claimed", credit: 2, streak: 3 }],
+        });
+        assert.deepEqual(await page.locator("#warmTabs [role=tab]:visible").allTextContents(), ["Codex", "Claude Code", "Trae CN"]);
+        await page.setViewportSize({ width: 900, height: 1000 });
+        await page.locator("#warmTab-trae").click();
+        assert.deepEqual(await shown(page), { on: ["trae"], panes: ["trae"], focus: "trae" });
+        assert.deepEqual(await page.locator(".warm-panes .row.pref:visible .who .name").allTextContents(), [w.checkin]);
+        assert((await page.locator("#traeCheckinSub").textContent()).includes(w.checked), "today's check-in is shown");
+        await page.locator("#traeCheckinSegs .opt", { hasText: w.on }).first().click();
+        for (let i = 0; i < 50 && !posts.length; i++) await page.waitForTimeout(40);
+        assert.equal(posts.at(-1).traeCheckin, true);
+        assert.equal(posts.at(-1).workbuddyCheckin, false);
         assert.deepEqual(errors, []);
       });
     }

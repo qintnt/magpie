@@ -25,7 +25,9 @@ const { webkit } = require("playwright");
 const { babelParse } = require("playwright/lib/transform/babelBundle");
 
 const assets = path.resolve(__dirname, "../assets");
-const scripts = async () => (await fs.readdir(assets)).filter((f) => f.endsWith(".js")).sort();
+// the page's scripts, the built-in plugins' under plugins/ among them, as
+// index.html names them
+const scripts = async () => (await fs.readdir(assets, { recursive: true })).map((f) => f.split(path.sep).join("/")).filter((f) => f.endsWith(".js")).sort();
 const styles = async () => (await fs.readdir(assets)).filter((f) => f.endsWith(".css")).sort();
 const read = (f) => fs.readFile(path.join(assets, f), "utf8");
 
@@ -155,10 +157,19 @@ test("the styles hold up in Safari 15.0", async () => {
     for (const m of css.matchAll(/([^{}]+)\{/g)) {
       const sel = m[1].trim();
       if (sel.startsWith("@")) continue;
-      const parts = sel.split(",");
+      // the list's own commas, not those inside :is() or :not()
+      const parts = []; let depth = 0, from = 0;
+      for (let i = 0; i < sel.length; i++) {
+        if (sel[i] === "(") depth++;
+        else if (sel[i] === ")") depth--;
+        else if (sel[i] === "," && !depth) { parts.push(sel.slice(from, i)); from = i + 1; }
+      }
+      parts.push(sel.slice(from));
       if (parts.some((p) => p.includes(":focus-visible")) && !parts.every((p) => p.includes(":focus-visible"))) bad.push(`${f}:~${lineOf(m.index)} :focus-visible in a selector list (Safari 15.4 drops the rule): ${sel.slice(0, 90)}`);
       if (/:is\([^)]*:focus-visible/.test(sel)) bad.push(`${f}:~${lineOf(m.index)} :focus-visible inside :is(): ${sel.slice(0, 90)}`);
     }
+    // a rule kept off a focused control drops whole there: one for :focus beside it
+    if (/:not\([^)]*:focus-visible/.test(css) && !/@supports not selector\(:focus-visible\)/.test(css)) bad.push(`${f}: :not(:focus-visible) (Safari 15.4) with no @supports not selector(:focus-visible) fallback`);
     if (/@container\b/.test(css) && !/@supports not \(container-type: inline-size\)/.test(css)) bad.push(`${f}: @container (Safari 16) with no @supports not (container-type: inline-size) fallback`);
     if (/:\s*subgrid\b/.test(css) && !/@supports not \(grid-template-columns: subgrid\)/.test(css)) {
       // a subgrid that only lines rows up across cards may go without

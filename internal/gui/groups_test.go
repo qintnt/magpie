@@ -90,3 +90,104 @@ func TestGroupsFoundSwitch(t *testing.T) {
 		t.Fatalf("on again: %v %+v", st.Found, st.Groups)
 	}
 }
+
+// groups/delete with ids removes them all at once (lc on Discord), or none
+// when it can't remove one.
+func TestGroupsDeleteSeveral(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	for _, id := range []string{"a", "b"} {
+		if err := provider.Save(provider.Provider{ID: id, Name: id, Key: "k" + id, Chat: "http://127.0.0.1:1/v1", Models: []string{"m", "n"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := provider.SaveGroup(provider.Group{Name: "Mine", Members: []string{"a/m", "b/n"}}); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	groupRoutes(mux)
+	del := func(body string) (int, groupsJSON) {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/groups/delete", strings.NewReader(body)))
+		var st groupsJSON
+		json.Unmarshal(w.Body.Bytes(), &st)
+		return w.Code, st
+	}
+	shown := func(st groupsJSON) (out []string) {
+		for _, g := range st.Groups {
+			if !g.Hidden {
+				out = append(out, g.ID)
+			}
+		}
+		return out
+	}
+	if code, _ := del(`{"ids":["auto-m","gone"]}`); code == 200 {
+		t.Fatal("a group not there was removed")
+	}
+	if got := shown(groupsState()); len(got) != 3 {
+		t.Fatalf("a refused removal removed some: %v", got)
+	}
+	code, st := del(`{"ids":["auto-m","mine"]}`)
+	if code != 200 {
+		t.Fatalf("%d", code)
+	}
+	if got := shown(st); len(got) != 1 || got[0] != "auto-n" {
+		t.Fatalf("left: %v", got)
+	}
+	// one by its id alone, as the editor's Remove does
+	if code, st := del(`{"id":"auto-n"}`); code != 200 || len(shown(st)) != 0 {
+		t.Fatalf("%d %v", code, shown(st))
+	}
+}
+
+// The tray panel's pick (#2489) switches a Manual group's member and
+// answers with the groups' state, its picked member the new one; a model
+// not in the group is refused.
+func TestGroupsPick(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	for _, id := range []string{"a", "b"} {
+		if err := provider.Save(provider.Provider{ID: id, Name: id, Key: "k" + id, Chat: "http://127.0.0.1:1/v1", Models: []string{"gpt-6-astra"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "hand", Name: "Hand", Members: []string{"a/gpt-6-astra", "b/gpt-6-astra"}, Routing: provider.Manual}); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	groupRoutes(mux)
+	post := func(body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/groups/pick", strings.NewReader(body)))
+		return w
+	}
+	w := post(`{"id":"hand","pick":"b/gpt-6-astra"}`)
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	var st struct {
+		Groups []struct{ ID, Picked string }
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	picked := ""
+	for _, g := range st.Groups {
+		if g.ID == "hand" {
+			picked = g.Picked
+		}
+	}
+	if picked != "b/gpt-6-astra" {
+		t.Fatalf("picked %q in %s", picked, w.Body)
+	}
+	if w := post(`{"id":"hand","pick":"c/gpt-6-astra"}`); w.Code < 400 {
+		t.Fatalf("a model not in the group taken: %d", w.Code)
+	}
+	if g, _, _ := provider.FindGroup("group/hand"); g.Pick != "b/gpt-6-astra" {
+		t.Fatalf("%+v", g)
+	}
+}

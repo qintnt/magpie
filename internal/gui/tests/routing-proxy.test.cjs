@@ -57,7 +57,7 @@ function serve(lang) {
 
 const want = {
   en: { story: "the proxy magpie goes through didn't take the connection, so the request never reached the vendor and goes on to the next", rest: "so it doesn't rest", tag: "502 · proxy not reachable" },
-  zh: { story: "magpie 所走的代理没有接受连接，请求根本没到厂商，所以转给了下一个", rest: "所以不用休息", tag: "502 · 代理连不上" },
+  zh: { story: "magpie 使用的代理未接受连接，请求未到达厂商，已转给下一个", rest: "不休息", tag: "502 · 代理连不上" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -78,11 +78,23 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       await page.goto("http://magpie.test/?view=routing");
-      await page.locator(".rt-day").nth(1).click();
+      await page.locator(".rt-days .rt-day").nth(1).click();
       await page.locator(".rt-req").nth(routes.length - 1).waitFor();
 
       const row = page.locator(".rt-req").nth(0);
-      const was = await row.evaluate((e) => e.getBoundingClientRect().top);
+      // measure once the page holds still: the day's rows arriving grow the
+      // page above the list, and the day button's click is kept in place by
+      // scrolling the view, which can land after the last row is in
+      const was = await row.evaluate(async (e) => {
+        let last = NaN;
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => requestAnimationFrame(r));
+          const top = e.getBoundingClientRect().top;
+          if (top === last) return top;
+          last = top;
+        }
+        return last;
+      });
       await row.click();
       await page.waitForTimeout(400);
       assert(Math.abs((await row.evaluate((e) => e.getBoundingClientRect().top)) - was) <= 1, "picking the request moved the page");
@@ -90,7 +102,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const story = steps.find((s) => s.includes(want[lang].story));
       assert(story, JSON.stringify(steps));
       assert(story.includes(want[lang].rest) && story.includes("Grok (SuperGrok)"), story);
-      assert(!steps.some((s) => s.includes("wouldn't fix") || s.includes("也解决不了")), JSON.stringify(steps));
+      assert(!steps.some((s) => s.includes("wouldn't fix") || s.includes("换账号也无法解决")), JSON.stringify(steps));
       const text = await page.locator("body").innerText();
       assert(text.includes(want[lang].tag), "no tag " + want[lang].tag);
       assert.deepEqual(errors, []);

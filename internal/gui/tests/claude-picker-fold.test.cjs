@@ -7,12 +7,15 @@
 // one, opened at a click without the page moving; an alias and its dated
 // id are one row, the alias's, or the dated one's while that is the value
 // set. In English and Chinese. No backend: the API is faked here.
-// The fold row ends Claude Code's own rows, though the account comes after
-// the providers the user added (where it was, Claude Code was headed twice);
+// The fold row ends Claude Code's own rows, which come after magpie's
+// (abledo on Discord: they hid every magpie model below the fold), though
+// the account is listed among magpie's (where it was, Claude Code was
+// headed twice);
 // a click on it leaves the keys to the filter (focus went to the page, and
 // Esc and the arrows did nothing); a query shows the rows it finds, so an id
 // typed in full is picked with Enter (which only opened the fold); and a
-// star on a dated id still shows (its row was gone, Favorites empty).
+// star on a dated id still shows (its row was gone, Favorites empty). The
+// picker is the one beside the connected row's switch.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -37,7 +40,7 @@ const options = [
   via("claude/claude-opus-4-5-20251101", "Claude Opus 4.5", "claude/claude-opus-4-5"),
 ];
 const state = (value) => ({
-  agents: [{ id: "claude", name: "Claude Code", icon: "claudecode-color", path: "/test/settings.json",
+  agents: [{ id: "claude", name: "Claude Code", icon: "claudecode-color", path: "/test/settings.json", wired: true,
     fields: [{ key: "model", label: "model", value, options }] }],
   profiles: [],
 });
@@ -89,7 +92,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", server(lang, value, sets));
       await page.goto("http://magpie.test/");
       await page.locator(row).waitFor();
-      await page.locator(`${row} .field[data-key="model"]`).click();
+      await page.locator(`${row} > .field.ag-start[data-key="model"]`).click();
       await page.locator("#pop:not([hidden]) #list li").first().waitFor();
       await page.waitForTimeout(400); // the picker grows open
       return page;
@@ -117,10 +120,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(fold[0].v, w.two);
         assert.equal(fold[0].n, w.whose);
         assert(names.includes("DeepSeek V4"), "another provider's stay unfolded");
-        // after Claude Code's own rows, before the providers the user added:
-        // Claude Code is headed once
-        assert.deepEqual(await page.locator("#list li.group").allTextContents(), ["Claude Code", "DeepSeek"]);
-        assert.equal(await page.locator("#list li.fold + li.group").textContent(), "DeepSeek");
+        // magpie's first, then Claude Code's own rows and the fold after
+        // them: Claude Code is headed once
+        assert.deepEqual(await page.locator("#list li.group").allTextContents(), ["DeepSeek", "Claude Code"]);
+        assert.equal(await page.locator("#list li:last-child.fold").count(), 1);
         const foldRow = page.locator("#list li.fold");
         assert.equal(await foldRow.getAttribute("aria-expanded"), "false");
 
@@ -147,7 +150,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator(`${row} .field[data-key="model"]`).click();
         await page.locator("#pop:not([hidden]) #list li").first().waitFor();
         list = await rows(page);
-        assert.deepEqual(list[1], { v: "Claude Opus 5.5", n: "me@example.com · via magpie", cur: true, fold: false }, JSON.stringify(list));
+        // after Default and, connected, the way back
+        assert.deepEqual(list[2], { v: "Claude Opus 5.5", n: "me@example.com", cur: true, fold: false }, JSON.stringify(list));
+        // "via magpie" is said once, as its tag, beside Claude Code's own marked direct (#726)
+        assert.equal(await page.locator("#list li.cur .badge.path.via").textContent(), lang === "en" ? "via magpie" : "经 magpie");
+        assert.equal(await page.locator("#list li:not(.cur)", { hasText: "claude-opus-5-5" }).first().locator(".badge.path.direct").count(), 1);
         assert.equal(list.filter((r) => r.fold).map((r) => r.v).join(), w.one);
         await page.context().close();
       });
@@ -179,7 +186,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#q").fill("Claude Opus 5.5");
         const list = await rows(page);
         assert(!list.some((r) => r.fold), JSON.stringify(list));
-        assert(list.some((r) => r.v === "Claude Opus 5.5" && r.n === "me@example.com · via magpie"), JSON.stringify(list));
+        assert(list.some((r) => r.v === "Claude Opus 5.5" && r.n === "me@example.com"), JSON.stringify(list));
         await page.locator("#q").fill("claude/claude-opus-5-5[1m]");
         await page.keyboard.press("Enter");
         await page.waitForFunction(() => document.querySelector("#pop").hidden);
@@ -194,7 +201,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert(names.includes("claude-opus-4-5-20251101") && !names.includes("claude-opus-4-5"), names.join(", "));
         await page.locator('#pickerRail .rail-item[data-group="favorites"]').click();
         await page.waitForFunction(() => document.querySelectorAll("#list li:not(.group)").length === 2);
-        assert.deepEqual((await rows(page)).map((r) => r.v), ["claude-opus-4-5-20251101", "Claude Opus 4.5"]);
+        assert.deepEqual((await rows(page)).map((r) => r.v), ["Claude Opus 4.5", "claude-opus-4-5-20251101"]);
         await page.context().close();
       });
     }

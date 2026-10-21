@@ -65,6 +65,7 @@ func openaiIDs(got *[]string) http.HandlerFunc {
 		}
 		w.Header()["Content-Type"] = nil
 		io.WriteString(w, sse(`data: {"type":"response.output_text.delta","delta":"on it"}`,
+			`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"on it"}]}}`,
 			`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`))
 	}
 }
@@ -81,7 +82,15 @@ const otherVendorsCalls = `[{"type":"message","role":"user","content":[{"type":"
 
 // sentAsOpenAI is what the upstream must have been given: the calls' ids
 // of their own kinds, the call_ids their outputs name them by as they came.
-var sentAsOpenAI = []string{`"tsc_18da5b9a10256a3e00000011"`, `"ctc_18da5b9a10256a3e00000012"`, `"ctc_openai"`,
+// The search goes as a function's call and result, as it went in the turns
+// that offered it, and so with no id of its own (#1171).
+var sentAsOpenAI = []string{`"ctc_18da5b9a10256a3e00000012"`, `"ctc_openai"`,
+	`"call_id":"s1","name":"tool_search","type":"function_call"`, `"call_id":"p1"`, `"call_id":"p2"`, "fix it"}
+
+// sentToChatGPT is what the ChatGPT backend, which runs Codex's search as
+// Codex sends it, must have been given: the search's call too with an id of
+// its kind.
+var sentToChatGPT = []string{`"tsc_18da5b9a10256a3e00000011"`, `"ctc_18da5b9a10256a3e00000012"`, `"ctc_openai"`,
 	`"call_id":"s1"`, `"call_id":"p1"`, `"call_id":"p2"`, "fix it"}
 
 // The same conversation going on through a magpie model or a routing group
@@ -124,6 +133,67 @@ func TestMagpieModelOpenAICallIDs(t *testing.T) {
 	}
 }
 
+func TestResponsesRelayCallIDs(t *testing.T) {
+	fresh(t)
+	var got []string
+	relay := httptest.NewServer(openaiIDs(&got))
+	t.Cleanup(relay.Close)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Models: []string{"m1"},
+		Responses: relay.URL + "/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	refusalGroup(t, "relay/m1")
+	s := New()
+	for _, model := range []string{"relay/m1", "group/g"} {
+		for _, tc := range []struct {
+			name    string
+			path    string
+			compact bool
+		}{
+			{"responses", "/v1/responses", false},
+			{"codex", CodexPath + "/responses", false},
+			{"compact", CodexPath + "/responses", true},
+		} {
+			t.Run(model+"/"+tc.name, func(t *testing.T) {
+				input := otherVendorsCalls
+				if tc.compact {
+					input = strings.TrimSuffix(input, "]") + `,{"type":"compaction_trigger"}]`
+				}
+				body := `{"model":"` + model + `","stream":true,"store":false,"tools":[{"type":"custom","name":"apply_patch"}],"input":` + input + `}`
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest("POST", tc.path, strings.NewReader(body))
+				req.Header.Set("Authorization", "Bearer chatgpt-token")
+				req.Header.Set("chatgpt-account-id", "acct-1")
+				before := len(got)
+				s.Handler().ServeHTTP(rec, req)
+				if rec.Code != 200 || len(got) != before+1 {
+					t.Fatalf("status %d, upstream calls %d: %s", rec.Code, len(got)-before, rec.Body)
+				}
+				last := got[len(got)-1]
+				for _, want := range sentAsOpenAI {
+					if !strings.Contains(last, want) {
+						t.Errorf("upstream lacks %s: %s", want, last)
+					}
+				}
+				if tc.compact {
+					var sent map[string]json.RawMessage
+					if err := json.Unmarshal([]byte(last), &sent); err != nil {
+						t.Fatal(err)
+					}
+					if string(sent["tools"]) != "[]" || !strings.Contains(last, "CONTEXT CHECKPOINT COMPACTION") {
+						t.Errorf("not a compaction request: %s", last)
+					}
+					if !strings.Contains(rec.Body.String(), `"type":"compaction"`) || !strings.Contains(rec.Body.String(), magpieCompaction) {
+						t.Errorf("not a compaction response: %s", rec.Body)
+					}
+				} else if !strings.Contains(rec.Body.String(), "on it") {
+					t.Errorf("missing response text: %s", rec.Body)
+				}
+			})
+		}
+	}
+}
+
 // Codex's own model, on a turn and on a compaction, gives a custom tool's
 // call another vendor answered a ctc_ id too.
 func TestCodexOwnModelCustomCallIDs(t *testing.T) {
@@ -140,7 +210,7 @@ func TestCodexOwnModelCustomCallIDs(t *testing.T) {
 			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
 		}
 		last := got[len(got)-1]
-		for _, want := range sentAsOpenAI {
+		for _, want := range sentToChatGPT {
 			if !strings.Contains(last, want) {
 				t.Errorf("%s: upstream lacks %s: %s", path, want, last)
 			}

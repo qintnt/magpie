@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf16"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // DeepSeek Harness (dsh) keeps a session in a folder of its own, under
@@ -34,7 +37,7 @@ import (
 
 // DshDir is dsh's folder: $DSH_HOME, else ~/.dsh.
 func DshDir() string {
-	if d := os.Getenv("DSH_HOME"); d != "" {
+	if d := appdir.Getenv("DSH_HOME"); d != "" {
 		return expandHome(d)
 	}
 	home, _ := os.UserHomeDir()
@@ -123,6 +126,53 @@ func dshFiles() []file {
 	return out
 }
 
+// dshSessionDir is the folder dsh keeps a session file's session in, all
+// of it that session's own: <sessions>/<project>/<the id, escaped>/, with
+// the session's generations and its session.lock. "" when the file isn't
+// in the folder its id names, so a delete never takes another's.
+func dshSessionDir(f file) string {
+	if f.agent != "dsh" || f.sid == "" {
+		return ""
+	}
+	d := filepath.Dir(f.path)
+	if filepath.Base(d) != dshSegment(f.sid) || filepath.Dir(filepath.Dir(d)) != filepath.Join(DshDir(), "sessions") {
+		return ""
+	}
+	return d
+}
+
+// dshSegment is a session id as dsh names its folder (encodeSegment in
+// dsh-session-persistence-jsonl): A–Z, a–z, 0–9, '.', '_' and '-' kept,
+// every other UTF-16 unit ~XXXX, and "." and ".." escaped whole.
+func dshSegment(id string) string {
+	switch id {
+	case ".":
+		return "~002E"
+	case "..":
+		return "~002E~002E"
+	}
+	var b strings.Builder
+	for _, u := range utf16.Encode([]rune(id)) {
+		if u < 0x80 && (u >= 'A' && u <= 'Z' || u >= 'a' && u <= 'z' || u >= '0' && u <= '9' || u == '.' || u == '_' || u == '-') {
+			b.WriteByte(byte(u))
+		} else {
+			fmt.Fprintf(&b, "~%04X", u)
+		}
+	}
+	return b.String()
+}
+
+// dshCacheRecord is the row dsh's session listing caches of a session
+// (dsh-session-projection-cache, on dsh-storage-json's per-record layout):
+// <dsh>/storages/session_projcache/sessions/<id>.json. "" for an id that
+// layout can't hold.
+func dshCacheRecord(id string) string {
+	if !safeID.MatchString(id) {
+		return ""
+	}
+	return filepath.Join(DshDir(), "storages", "session_projcache", "sessions", id+".json")
+}
+
 // dshOpen reads a session file's lines, decompressed.
 func dshOpen(path string) (io.ReadCloser, error) { return openLines(path) }
 
@@ -140,6 +190,30 @@ func dshReadHead(path string) (dshHead, bool) {
 	return h, true
 }
 
+// dshResponse is what the vendor's own reply named: the model and provider
+// that answered, under a streamed reply's replay state.
+type dshResponse struct {
+	Model         string `json:"model"`
+	Provider      string `json:"provider"`
+	ResponseModel string `json:"responseModel"`
+}
+
+// dshReplay is a reply's replay state, where dsh keeps what the vendor's own
+// reply named: it is the only place a swapped model shows (the provider
+// answered with another).
+type dshReplay struct {
+	Response dshResponse `json:"response"`
+}
+
+// dshSource is the source of an assistant/message: the model and provider dsh
+// was told to use, and, under ReplayState, the replay state's record of the
+// response.
+type dshSource struct {
+	Model       string    `json:"model"`
+	Provider    string    `json:"provider"`
+	ReplayState dshReplay `json:"replayState"`
+}
+
 // dshEvent is an event line: packed rows of a streamed reply's chunks carry
 // neither type nor time of their own and are passed over.
 type dshEvent struct {
@@ -154,9 +228,7 @@ type dshEvent struct {
 		Title     string `json:"title"`
 		Inherited bool   `json:"inherited"`
 		Message   struct {
-			Source struct {
-				Model string `json:"model"`
-			} `json:"source"`
+			Source dshSource `json:"source"`
 		} `json:"message"`
 		Usage *struct {
 			Input      int `json:"inputTokens"`
@@ -169,86 +241,116 @@ type dshEvent struct {
 
 var dshWanted = [][]byte{[]byte(`"user/message"`), []byte(`"session/title"`), []byte(`"assistant/message"`), []byte(`"session/end-seed"`)}
 
-// parseDsh reads a session file whole: compressed, it can't be read on from
-// the middle of a frame.
-func parseDsh(f file) *state {
-	s := &state{Size: f.size, Mod: f.mod.UnixNano()}
-	r, err := dshOpen(f.path)
-	if err != nil {
-		return s
+// dshCarry is what a read of a dsh session file carries on with: where it
+// read to and the header it read first.
+type dshCarry struct {
+	Tail *tail   `json:"tail,omitempty"`
+	Head dshHead `json:"head"`
+}
+
+// parseDsh reads a session file. dsh only appends to one, a line at a time
+// or, packed, a frame of lines at a time, so a file read before is read on
+// from where that read left off: a packed one from the frame it left off
+// in. A file cut short or replaced is read whole again, and a line or frame
+// not yet written whole waits for the next read.
+func parseDsh(f file, old *state) *state {
+	var s *state
+	var c dshCarry
+	var off, skip int64
+	if old != nil && old.Dsh != nil && old.Dsh.Tail.holds(f.path) {
+		s, c = old.clone(), *old.Dsh
+		off, skip = c.Tail.Off, c.Tail.Skip
+	} else {
+		s = &state{}
 	}
-	defer r.Close()
-	br := bufio.NewReaderSize(r, 1<<20)
-	var h dshHead
-	var evs []dshEvent
-	for first := true; ; first = false {
-		b, err := br.ReadBytes('\n')
-		if err != nil {
-			// a line still being written, or a frame cut short
-			if !errors.Is(err, io.EOF) || len(bytes.TrimSpace(b)) == 0 {
-				break
+	s.Size, s.Mod = f.size, f.mod.UnixNano()
+	headed := c.Tail != nil
+	ok := true
+	each := func(b []byte) bool {
+		b = bytes.TrimSpace(b)
+		if len(b) == 0 || len(b) > maxLine {
+			return true
+		}
+		if !headed {
+			headed = true
+			if json.Unmarshal(b, &c.Head) != nil || c.Head.Type != "session" {
+				ok = false
+				return false
 			}
+			s.ID, s.Cwd = c.Head.ID, c.Head.Cwd
+			s.saw(ms(c.Head.CreatedAt), f.main)
+			return true
 		}
-		if b = bytes.TrimSpace(b); len(b) > 0 && len(b) <= maxLine {
-			if first {
-				if json.Unmarshal(b, &h) != nil || h.Type != "session" {
-					return s
-				}
-			} else if dshWant(b) {
-				var e dshEvent
-				if json.Unmarshal(b, &e) == nil && e.Type != "" {
-					evs = append(evs, e)
-				}
-			} else if t := dshNum(b, "time"); t > 0 {
-				// only its time and place looked at
-				e := dshEvent{Time: t}
-				if n := dshNum(b, "seq"); n >= 0 {
-					e.Seq = &n
-				}
-				evs = append(evs, e)
-			}
-		}
-		if err != nil {
-			break
-		}
+		dshCount(s, &c.Head, b, f.main)
+		return true
 	}
-	s.ID, s.Cwd = h.ID, h.Cwd
-	// the events a fork was seeded with
-	cut := -1
-	if h.Version >= 2 && h.IsSeeded {
-		for i, e := range evs {
-			if e.Type == "session/end-seed" && e.Data.Inherited {
-				cut = i
-			}
-		}
+	var next, nextSkip, end int64
+	var err error
+	if packed(f.path) {
+		next, nextSkip, end, err = scanFrames(f.path, off, skip, each)
+	} else {
+		next, err = scanAt(f.path, off, nil, func(b []byte, _, _ int64) bool { return each(b) })
+		end = next
 	}
-	s.saw(ms(h.CreatedAt), f.main)
-	for i, e := range evs {
-		inherited := i <= cut || h.Version < 2 && e.Seq != nil && *e.Seq < h.SeedLength
-		switch e.Type {
-		case "user/message":
-			if f.main && s.Title == "" && s.First == "" && e.Data.Source.Kind == "user" {
-				if t := ccText(e.Data.Content); strings.HasPrefix(t, "<") {
-					s.First = untagged(t)
-				} else {
-					s.Title = title(t)
-				}
-			}
-		case "session/title":
-			if t := title(e.Data.Title); t != "" {
-				s.Named = t
-			}
-		}
-		if inherited {
-			continue
-		}
-		at := ms(e.Time)
-		s.saw(at, f.main)
-		if u := e.Data.Usage; e.Type == "assistant/message" && u != nil && e.Data.Message.Source.Model != "" {
-			s.use(dateOf(at), e.Data.Message.Source.Model, Tokens{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite})
-		}
+	if !ok {
+		// not a session's file: only its size and time
+		return &state{Size: f.size, Mod: f.mod.UnixNano()}
 	}
+	c.Tail = nil
+	if err == nil {
+		c.Tail = markTail(f.path, next, nextSkip, end)
+	}
+	s.Dsh = &c
 	return s
+}
+
+// dshCount counts one event of a session file after its header.
+func dshCount(s *state, h *dshHead, b []byte, main bool) {
+	var e dshEvent
+	if dshWant(b) {
+		if json.Unmarshal(b, &e) != nil || e.Type == "" {
+			return
+		}
+	} else if t := dshNum(b, "time"); t > 0 {
+		// only its time and place looked at
+		e.Time = t
+		if n := dshNum(b, "seq"); n >= 0 {
+			e.Seq = &n
+		}
+	} else {
+		return
+	}
+	switch e.Type {
+	case "user/message":
+		if main && s.Title == "" && s.First == "" && e.Data.Source.Kind == "user" {
+			if t := ccText(e.Data.Content); strings.HasPrefix(t, "<") {
+				s.First = untagged(t)
+			} else {
+				s.Title = title(t)
+			}
+		}
+	case "session/title":
+		if t := title(e.Data.Title); t != "" {
+			s.Named = t
+		}
+	case "session/end-seed":
+		if h.Version >= 2 && h.IsSeeded && e.Data.Inherited {
+			// the events a fork was seeded with end here: what was
+			// counted of them is its source's
+			n := &state{ID: s.ID, Cwd: s.Cwd, Title: s.Title, First: s.First, Named: s.Named, Size: s.Size, Mod: s.Mod}
+			n.saw(ms(h.CreatedAt), main)
+			*s = *n
+			return
+		}
+	}
+	if h.Version < 2 && e.Seq != nil && *e.Seq < h.SeedLength {
+		return
+	}
+	at := ms(e.Time)
+	s.saw(at, main)
+	if u := e.Data.Usage; e.Type == "assistant/message" && u != nil && e.Data.Message.Source.Model != "" {
+		s.use(dateOf(at), e.Data.Message.Source.Model, Tokens{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite})
+	}
 }
 
 func dshWant(b []byte) bool {

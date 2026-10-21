@@ -13,6 +13,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -58,8 +59,8 @@ const words = {
   },
   zh: {
     container: "在容器中运行",
-    opened: "即打开本页所用的地址，端口为网关的端口；可用 MAGPIE_PUBLIC_URL 改成别的",
-    own: "这是容器自己的地址，其他设备连不上：请把 MAGPIE_PUBLIC_URL 设为宿主机的地址",
+    opened: "打开本页所用的地址，端口为网关端口；可用 MAGPIE_PUBLIC_URL 另设",
+    own: "容器自身的地址，其他设备无法访问：请将 MAGPIE_PUBLIC_URL 设为宿主机地址",
   },
 };
 
@@ -83,7 +84,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, web, over));
+      await watchSettingsReads(page);
       await page.goto(at + "/?view=settings&tab=network");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       await page.locator("#lanList .lan-address-text").waitFor();
       return { page, errors };
     };

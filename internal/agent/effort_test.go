@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
@@ -19,11 +20,14 @@ func effortHome(t *testing.T) string {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// Crush's data file, the sandbox's rather than the package's shared one
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	// where Windows keeps Goose's, Crush's and Devin's: the sandbox's, never the machine's
 	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
 	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
 	t.Setenv("HERMES_HOME", "")
 	t.Setenv("MIMOCODE_HOME", "")
+	t.Setenv("DEVECO_CONFIG_DIR", "")
 	t.Setenv("HANA_HOME", "")
 	t.Setenv("DSH_HOME", "")
 	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
@@ -78,7 +82,7 @@ func TestEffortFields(t *testing.T) {
 	// env (TestClaudeEffortMax)
 	setEffort(t, c, "max", `"theme"`)
 
-	writeFile(t, filepath.Join(home, ".hermes", "config.yaml"), "model:\n  default: x\nagent:\n  max_turns: 9\n")
+	writeFile(t, filepath.Join(appdir.HermesHomeIn(home), "config.yaml"), "model:\n  default: x\nagent:\n  max_turns: 9\n")
 	h := hermes(home)
 	setEffort(t, h, "none", "max_turns: 9")
 	if v, _ := edit.GetYAML(h.Path, "model.default"); v != "x" {

@@ -51,7 +51,7 @@ func TestRejectedOnlyInRequestRows(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	catalog.Reset()
 	t.Cleanup(catalog.Reset)
-	now := time.Now()
+	now := holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
 	recs := []Record{{Time: now, Agent: "codex", Provider: "relay", Model: "m", Status: 200, Input: 2}, {Time: now, Agent: "codex", Status: 404, Error: "unknown model", Rejected: true}, {Time: now, Agent: "codex", Status: 400}}
 	rows, sum, _ := ledger(time.Time{}, Filter{}, recs)
 	if len(rows) != 3 || sum.Calls != 1 || sum.Errors != 0 {
@@ -158,12 +158,12 @@ func TestZeroTokenFailuresDeduplicateAndRejectedStayVisible(t *testing.T) {
 		t.Fatal("local rejection consumed a real API call")
 	}
 	Append(r)
-	if len(Vias(time.Time{})) != 0 {
+	if Vias(time.Time{}).Len() != 0 {
 		t.Fatal("rejected request appears as a session provider")
 	}
 	Append(Record{Time: at, Agent: "claude", Provider: "relay", Model: "m", Session: "s", Status: 200})
 	Append(Record{Time: at, Agent: "claude", Model: "m", Session: "s", Status: 400}) // legacy rejection
-	if vias := Vias(time.Time{}); len(vias) != 1 || len(vias["claude|s"]) != 1 || vias["claude|s"][0].Calls != 1 {
+	if vias := Vias(time.Time{}); vias.Len() != 1 || len(vias.Of("claude|s")) != 1 || vias.Of("claude|s")[0].Calls != 1 {
 		t.Fatalf("session via includes a local rejection: %+v", vias)
 	}
 	var out bytes.Buffer

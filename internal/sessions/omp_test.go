@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -23,7 +24,7 @@ func TestOmp(t *testing.T) {
 		t.Fatalf("want 3 omp sessions (the subagents and advisor in theirs), got %d", n)
 	}
 	m := find(t, ss, "omp", ompMain)
-	if m.Cwd != "/work/omp" || m.Title != "Port the parser" {
+	if m.Cwd != "/work/omp" || m.Title != "Port the parser to omp" {
 		t.Fatalf("omp: %+v", m)
 	}
 	// the task tool's summed usage not counted again
@@ -31,10 +32,10 @@ func TestOmp(t *testing.T) {
 		model string
 		want  Tokens
 	}{
-		{"claude-opus-5-5", Tokens{110, 55, 1500, 200}},
-		{"claude-haiku-5", Tokens{20, 5, 0, 0}},      // a model_usage entry
-		{"claude-sonnet-5", Tokens{340, 34, 100, 0}}, // the subagent and its own
-		{"gpt-6-astra", Tokens{50, 10, 0, 0}},        // the advisor
+		{"claude-opus-5-5", Tokens{110, 55, 1500, 200, 0}},
+		{"claude-haiku-5", Tokens{20, 5, 0, 0, 0}},      // a model_usage entry
+		{"claude-sonnet-5", Tokens{340, 34, 100, 0, 0}}, // the subagent and its own
+		{"gpt-6-astra", Tokens{50, 10, 0, 0, 0}},        // the advisor
 	} {
 		if got := model(m, c.model); got.Tokens != c.want {
 			t.Fatalf("%s: %+v, want %+v", c.model, got, c.want)
@@ -46,15 +47,17 @@ func TestOmp(t *testing.T) {
 	if !m.Start.Equal(at("2026-09-28T08:00:00Z")) || !m.Last.Equal(at("2026-09-28T08:02:00Z")) {
 		t.Fatalf("omp times %s %s", m.Start, m.Last)
 	}
-	if runtime.GOOS != "windows" {
-		if want := "cd '/work/omp' && omp --resume " + ompMain; m.Resume != want {
-			t.Fatalf("resume %q", m.Resume)
-		}
+	want := "cd '/work/omp' && omp --resume " + ompMain
+	if runtime.GOOS == "windows" {
+		want = "Set-Location -LiteralPath '/work/omp'; omp --resume " + ompMain
+	}
+	if m.Resume != want {
+		t.Fatalf("resume %q", m.Resume)
 	}
 
 	// the fork: what it copied counted in the session it came from
 	f := find(t, ss, "omp", ompFork)
-	if f.Tokens != (Tokens{7, 3, 0, 0}) || f.Title != "Port the parser" {
+	if f.Tokens != (Tokens{7, 3, 0, 0, 0}) || f.Title != "Port the parser" {
 		t.Fatalf("fork: %+v", f)
 	}
 	if !f.Start.Equal(at("2026-09-29T09:00:00Z")) || !f.Last.Equal(at("2026-09-29T09:00:20Z")) {
@@ -85,6 +88,9 @@ func TestOmp(t *testing.T) {
 	Reset()
 	ss = List(0)
 	for id := range moves {
-		find(t, ss, "omp", id)
+		m := find(t, ss, "omp", id)
+		if id == ompNamed && !strings.Contains(m.Resume, "omp --profile work --resume "+id) {
+			t.Fatalf("profile resume %q", m.Resume)
+		}
 	}
 }
