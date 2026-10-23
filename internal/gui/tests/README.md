@@ -445,8 +445,17 @@ effort Claude Code asks for" / 「跟随 Claude Code 请求的推理强度」 un
 effort entry opens the effort slider without scrolling the page, Default its
 first stop, a level picked is posted for that tier's `<tier>_effort` alone and
 named in the square's title, and the session's effort stays. Its subagents'
-effort is a square that says what unset means for Claude Code, and a Claude
-Code not through magpie has no levels, no square and no effort entries.
+effort is on the Subagents row, not a square, and a Claude Code not through
+magpie has no levels, no square and no effort entries.
+
+`claude-subagent-effort-row.test.cjs` draws Claude Code's subagent effort in
+Chromium and WebKit, English and Chinese, at 1100px and 560px: it is at the
+right of the Subagents row in Tiers, laid out as the tiers' efforts are (same
+class, column and height), and the old square under New sessions is gone.
+With the subagents on Claude Code's pick it reads Default, is disabled and
+says to set a subagent model first (KorenKrita on Discord: magpie writes no
+effort then); with a model it opens the slider without scrolling the page and
+posts `subagent_effort`.
 
 `gateway-fold.test.cjs` folds Connect on the Gateway page with the view
 scrolled: its fields hide, the head keeps the base URL and a copy button, the
@@ -2158,8 +2167,8 @@ WebKit, in English and Chinese:
 node --test internal/gui/tests/plugin-progressive.test.cjs
 
 `lightweight.test.cjs` checks Settings → General's Lightweight mode row
-(#580): on for a user who never chose, Off and On saved as `lightweight`
-false and true without the page moving, another setting's save keeping the
+(#580): off for a user who never chose, On and Off saved as `lightweight`
+true and false without the page moving, another setting's save keeping the
 choice or leaving it unchosen (no `lightweight` posted), no left-border
 accent, and no such row on a browser's page (`web`). English and Chinese,
 Chromium and WebKit, with `/api/settings` faked:

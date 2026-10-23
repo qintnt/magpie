@@ -120,13 +120,16 @@ func scan(body []byte) (signed, args, defs []string) {
 // (Anthropic, Chat Completions, Responses, Gemini) and the choice among
 // them, the output's schema (Chat's response_format, Responses' text,
 // Anthropic's output_format and output_config, Gemini's generationConfig),
-// Responses' reasoning and include, and how the reply streams
+// Responses' reasoning and include, how the reply streams
 // (stream_options, whose reasoning_summary_delivery the vendor checks is
-// "sequential" or "sequential_cutoff", #3144).
+// "sequential" or "sequential_cutoff", #3144), and the client's ids that
+// no model reads (client_metadata: Codex's installation, session, thread,
+// turn and window, as a JSON string in x-codex-turn-metadata, which the
+// vendor and magpie's own sessions match a turn by).
 var defKeys = []string{
 	"tools", "tool_choice", "functions", "function_call", "toolConfig", "tool_config",
 	"response_format", "text", "reasoning", "include", "output_format", "output_config",
-	"generationConfig", "generation_config", "stream_options",
+	"generationConfig", "generation_config", "stream_options", "client_metadata",
 }
 
 // defItems are the Responses input items that carry tools: Responses
@@ -393,7 +396,7 @@ func MaskJSON(body []byte, o Options) ([]byte, int) {
 		if !masked(path, key, s) {
 			return s
 		}
-		t, n := mask(s, o, put)
+		t, n := mask(s, o, put, asJSON(key, ""))
 		total += n
 		return t
 	})
@@ -424,7 +427,7 @@ func MaskJSON(body []byte, o Options) ([]byte, int) {
 		// number or an address the vendor wrote of its own can be one
 		// masked in another conversation (13800138000 is in many), and
 		// masked, its text would no longer match its signature
-		t, n := apply(t, knownSpans(t, Options{Secrets: o.Secrets}), placeholder, o.Seen)
+		t, n := apply(t, knownSpans(t, Options{Secrets: o.Secrets}), placeholder, o)
 		total += n
 		return t
 	})

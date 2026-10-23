@@ -688,7 +688,8 @@ func addCmd(p provider.Provider) tea.Cmd {
 
 // endpointAsk asks for the address of a vendor reached at the user's own
 // (pr.Endpoint is its example): a remote magpie's, as the other
-// computer's magpie shows it in Settings, under Share on local network.
+// computer's magpie shows it in Settings → Network and sharing, under
+// Share on local network.
 // Nothing typed is said to be needed, as the app's editor says it.
 func endpointAsk(pr provider.PresetDef, crumbs []string, now string, then func(string) tea.Cmd) ask {
 	in := newInput(pr.Endpoint)
@@ -729,6 +730,9 @@ func localAddressAsk(pr provider.PresetDef, crumbs []string, now string, then fu
 // listError is provider.Provider.ListError; tests stand in for it.
 var listError = provider.Provider.ListError
 
+// signedOut is Provider.SignedOut, for a test to stand in for.
+var signedOut = provider.Provider.SignedOut
+
 func (m model) viewProviders() string {
 	var b strings.Builder
 	b.WriteString(m.header())
@@ -750,6 +754,9 @@ func (m model) viewProviders() string {
 		switch {
 		case p.Off:
 			r.key = "○ switched off"
+		case p.Account != nil && signedOut(p):
+			// every account in use refused, as magpie providers says it
+			r.key = "○ " + p.Account.User + " is signed out"
 		case p.Account != nil:
 			r.key = "● " + p.Account.User
 		case p.IsVertex() && !p.Ready():
