@@ -1,9 +1,7 @@
 package gateway
 
 import (
-	"bufio"
 	"encoding/json"
-	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -50,27 +48,40 @@ var realCallTurn = []string{
 // stdinOf gives run an input that records each line it is told.
 func stdinOf(t *testing.T, run *subscriptionRun) func() []string {
 	t.Helper()
-	pr, pw := io.Pipe()
-	run.stdin = pw
-	var mu sync.Mutex
-	var told []string
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s := bufio.NewScanner(pr)
-		s.Buffer(make([]byte, 64<<10), 1<<20)
-		for s.Scan() {
-			mu.Lock()
-			told = append(told, s.Text())
-			mu.Unlock()
+	w := &linesTold{}
+	run.stdin = w
+	return w.lines
+}
+
+// linesTold keeps what a run is told as each write is made, so a test reads
+// it the moment the reply is in. A pipe's write returned before its reader
+// had kept the line, and the check could come first (CI, 843417957).
+type linesTold struct {
+	mu   sync.Mutex
+	part string
+	told []string
+}
+
+func (w *linesTold) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.part += string(b)
+	for {
+		i := strings.IndexByte(w.part, '\n')
+		if i < 0 {
+			return len(b), nil
 		}
-	}()
-	t.Cleanup(func() { pw.Close(); pr.Close(); <-done })
-	return func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]string(nil), told...)
+		w.told = append(w.told, w.part[:i])
+		w.part = w.part[i+1:]
 	}
+}
+
+func (w *linesTold) Close() error { return nil }
+
+func (w *linesTold) lines() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.told...)
 }
 
 // A reply that writes its tool calls as "[tool call …]" text shows the
@@ -226,5 +237,33 @@ func TestClaudeTextToolCallsUnstreamed(t *testing.T) {
 	text, stop, _, _, raw, ended, ok := claudeReply(t, run, lines, true)
 	if text != "Validating.\n[mcp__ccd_turn__update_plan]" || stop != "tool_use" || ended != "tool" || !ok || len(told()) != 1 {
 		t.Fatalf("reply %q stop %q, run ended %q %v, told %q:\n%s", text, stop, ended, ok, told(), raw)
+	}
+}
+
+// Claude's own call written out as text (packinggoodsllc_07668: Claude Code
+// through a group of Claude models) is held back and asked for, as a
+// "[tool call …]" line is: bare or in its <function_calls>.
+func TestClaudeTextInvokeCallsAreMadeForReal(t *testing.T) {
+	for _, written := range []string{
+		invokeReported,
+		"<function_calls>\n" + `<invoke name="ToolSearch"><parameter name="query">select:mcp__magpie__magpie-browser__browser_navigate</parameter></invoke>` + "\n</function_calls>",
+	} {
+		run := &subscriptionRun{}
+		told := stdinOf(t, run)
+		lines := append(textCallTurn("msg_text", "好的。\n", written[:5], written[5:]), realCallTurn...)
+		text, stop, _, _, raw, ended, ok := claudeReply(t, run, lines, true)
+		if strings.Contains(raw, "invoke") || strings.Contains(raw, "Result:") {
+			t.Fatalf("the client was shown the calls written as text:\n%s", raw)
+		}
+		if text != "好的。\n[mcp__ccd_turn__update_plan]" || stop != "tool_use" || ended != "tool" || !ok || len(told()) != 1 {
+			t.Fatalf("reply %q stop %q, run ended %q %v, told %q:\n%s", text, stop, ended, ok, told(), raw)
+		}
+	}
+	// a line that only names the form mid-line, or starts like it, goes on
+	var c textCalls
+	words := "use <invoke name=\"x\"> to call\n<invoked> later\n<function_call"
+	shown := c.push(words)
+	if held, seen := c.end(); seen || shown+held != words {
+		t.Fatalf("shown %q, held %q (%v)", shown, held, seen)
 	}
 }

@@ -38,6 +38,15 @@ var summaries struct {
 
 func indexedSummary(p Period, now time.Time) Summary { return topSummary(p, now, -1) }
 
+// ReadAhead parses the log into its index and works out today's summary in
+// this computer's zone, for magpie to run as it starts: the first reader,
+// the tray panel's line of today's calls, finds both done. Parsing the log
+// cold took 0.33 s at 2 MB and 0.77 s at 40 MB on one core, and the
+// panel's numbers waited for it on the first open after a start
+// (CyberCaius on Discord). A reader that comes while it runs waits for the
+// same parse, never a second.
+func ReadAhead() { SummarizeTopIn(Today, summaryCacheSessions, nil) }
+
 // SummarizeTop is Summarize with only the top n sessions by tokens (all of
 // them for n < 0); SessionCount says how many the period has. It is what a page that
 // shows a few of them or none asks for: a summary of more than
@@ -79,7 +88,10 @@ func topSummary(p Period, now time.Time, n int) Summary {
 	if ok && old.version == snapshot.version && old.meta == meta && (n >= 0 && n <= len(old.value.Sessions) || old.value.SessionCount == len(old.value.Sessions)) {
 		return topOf(cloneSummary(old.value), n)
 	}
-	value := work()
+	summaries.Lock()
+	summaries.worked++
+	summaries.Unlock()
+	value := foldSummary(k, p, now, snapshot, meta)
 	// the cache keeps a copy with the top sessions only; the answer has as
 	// many as asked
 	kept := value
@@ -123,11 +135,19 @@ func usagePriceCacheKey(now time.Time) string {
 	// Sign-ins and plugin lists can change independently of providers.json.
 	// Their identity and price feeds affect both grouping and historical costs.
 	h := sha256.New()
-	prices, _ := json.Marshal(settings.Load().ModelPrices)
-	aliases, _ := json.Marshal(provider.Renamed())
-	fmt.Fprint(h, string(prices), string(aliases))
+	st := settings.Load()
+	prices, _ := json.Marshal(st.ModelPrices)
+	aliases := provider.UsageRenames().Key()
+	// and the names models' usage is counted under, which the groups key on
+	usageAliases, _ := json.Marshal(st.UsageAliases)
+	fmt.Fprint(h, string(prices), string(aliases), string(usageAliases))
 	for _, current := range provider.All() {
 		fmt.Fprintf(h, "%q:%q:%v:%t:%t:%t;", current.ID, current.Where(), current.Catalogs(), current.IsPlugin(), current.Account == nil, current.Key != "")
+		if current.Account != nil {
+			// a plan prices calls too: Codex's auto-review is free on a
+			// paid ChatGPT plan only (provider.ChatGPTReviewFree)
+			fmt.Fprintf(h, "%q;", current.Account.Plan)
+		}
 		fmt.Fprint(h, statKey(catalog.LivePath(current.ID)))
 	}
 	meta += fmt.Sprintf("|%x", h.Sum(nil))
