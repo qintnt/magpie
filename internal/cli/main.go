@@ -27,6 +27,7 @@ import (
 	"github.com/yetone/magpie/internal/imagemcp"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/notices"
+	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/pluginrt"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/profile"
@@ -73,6 +74,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie restore [--no-agents] [--no-library] <file> put a backup in on this machine
                                                      --sign-ins on backup: the subscriptions' and plugins' sign-ins too, sealed (off unless given); --no-sign-ins on restore leaves them out
   magpie uninstall [--yes]                           disconnect every agent, putting back what each had, then remove magpie's service and files
+                                                     --keep-data: all but deleting magpie's settings, providers and usage
   magpie webdav [on <address>|set k=v…|now|off]      the same, kept the same on every computer through a WebDAV folder (magpie webdav help)
   magpie s3 [on s3://<bucket>[/<prefix>]|set k=v…|now|off]   the same through an S3-compatible bucket: AWS, R2, B2, MinIO… (magpie s3 help)
   magpie github [on github://<owner>/<repo>[/<folder>]|set k=v…|now|off]   the same in an encrypted GitHub repository (magpie github help)
@@ -89,12 +91,13 @@ const usage = `magpie — one place to pick every agent's model
   magpie models [<agent>]         every model agents can pick, as provider/model; an agent's, and why others aren't
   magpie model name <provider/model> <name>|--reset       the name a model goes by, everywhere
   magpie model efforts <provider/model> <l>,<l>|--reset   the reasoning levels a model offers (magpie model help)
+  magpie model api <provider/model> chat|responses|anthropic|gemini|auto   the API a model is asked on
   magpie visible [<agent> <family|provider|group>,… | all | --only-picked | --show-new]
                                   which models an agent is shown: families (magpie provider/group set <id> family=…),
                                   or only the models ticked for it, a new one off until it is ticked
   magpie search [add <api> <key>|rm <api>]   Tavily, Brave, Exa, Firecrawl, You.com, DeepSeek, Doubao Search (Volcengine), Yuanbao Search (Tencent Cloud) or SearXNG for web search when no provider can search
   magpie groups                   routing groups: several models agents pick as one, group/<id>
-  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace|weight|free|fast|cheap|drain] [stays=auto|session|turn|off]
+  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace|weight|free|fast|cheap|drain|expiring] [stays=auto|session|turn|off]
   magpie group <id> | set <id> k=v… | rm <id>   show, change or remove one (magpie group help for more)
   magpie accounts [agent] [--json]  every subscription magpie knows, with each one's allowance used and when it resets
   magpie accounts add <agent>     sign in to one more Claude, ChatGPT or Google (Gemini CLI, Antigravity) subscription
@@ -282,6 +285,24 @@ var startUp = func() {
 	release()
 }
 
+// servesPages is whether magpie run with args serves plugins' pages,
+// and so runs the services they talk to (plugin.ServePages): the app,
+// tray, web, serve and the TUI do; a command that does its work and
+// ends doesn't.
+func servesPages(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(args[0]), "magpie:") {
+		return hasGUI
+	}
+	switch args[0] {
+	case "tui", "web", "serve", "tray", "app", "gui", "panel", "-Embedding":
+		return true
+	}
+	return false
+}
+
 func run(args []string) error {
 	// a command that saved a provider or a group ends with the agents'
 	// files written, which its save no longer waits for; and a test's run
@@ -379,6 +400,9 @@ func run(args []string) error {
 	if len(args) > 0 && args[0] == "serve" && plainServe(args[1:]) {
 		awaitGatewayFree(gatewayFreeEvery)
 	}
+	// a command that serves no pages starts a plugin host beside the
+	// app's, whose page services it leaves to the app (#5187)
+	plugin.ServePages(servesPages(args))
 	startUp()
 	// a provider added, edited or removed, or a list fetched anew, reaches
 	// the model lists agents keep in files of their own, behind the save
